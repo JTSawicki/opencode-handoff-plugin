@@ -1,8 +1,8 @@
 // auto-executor — an opencode plugin
 //
-// Sequential step execution: each iteration of a for loop in LaTeX writes
-// one sentence of a report. The plugin starts a new chat session for each
-// step, waits until the agent finishes, and then moves on to the next step.
+// Sequential execution of a task split into numbered steps (configured in a
+// JSON file): the plugin starts a new chat session for each step, waits until
+// the agent finishes, and then moves on to the next step.
 //
 // Commands:
 //   /auto-exec <path-to-json-file>  – start the step sequence
@@ -527,9 +527,10 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
         }
         // Threshold monitoring DURING the turn: every finished assistant message
         // (an iteration of the LLM loop) carries token state. Exceeding the threshold
-        // in a long turn aborts the turn right away — the handoff instruction will go
-        // in a new turn, without waiting for the natural end (when the context escapes
-        // even further).
+        // injects steering with the handoff instruction into the ongoing turn;
+        // once the instruction limit is exhausted, further exceedances abort the
+        // turn — without waiting for its natural end (when the context escapes
+        // even further) and without letting super-long sessions appear.
         if (
           info.role === "assistant" &&
           waiters.has(info.sessionID) &&
