@@ -1,165 +1,166 @@
 # opencode-handoff-plugin
 
-**auto-executor** — wtyczka [opencode](https://opencode.ai), która sekwencyjnie wykonuje
-kroki (muszisz je zapewnić opisane i ponumerowane w osobnym pliku MarkDown) zadania z pliku JSON: **jeden krok = jedna nowa sesja czatu**. Gdy w trakcie kroku
-zużycie kontekstu przekroczy próg, agent dostaje komunikat i wywołuje narzędzie
-`handoff_save`, co uruchamia **nową konwersację w ramach tego samego kroku**
-(prompt początkowy + „Co zrobiono dotychczas: {opis agenta}").
+**auto-executor** — an [opencode](https://opencode.ai) plugin that sequentially executes
+the steps of a task from a JSON file (you must provide the steps, described and numbered, in a separate MarkDown file): **one step = one new chat session**. If during a step
+the context usage exceeds the threshold, the agent gets a message and calls the
+`handoff_save` tool, which starts **a new conversation within the same step**
+(initial prompt + "Progress so far: {agent's description}").
 
-## Rozwój z udziałem AI
+## AI-assisted development
 
-Projekt powstał przy intensywnym wsparciu AI: **zdecydowana większość kodu wtyczki
-została napisana przez AI**. 
-Wtyczka była testowana z modelem **GLM 5.3 Flash** (opencode 1.18.33).
+This project was created with heavy AI support: **the vast majority of the plugin
+code was written by AI**.
+The plugin was tested with the **GLM 5.3 Flash** model (opencode 1.18.33).
 
-## Wymagania
+## Requirements
 
-- opencode ≥ 1.18 (testowane na 1.18.33)
-- brak zależności — wtyczka jest pojedynczym plikiem TypeScript (type-only import)
+- opencode ≥ 1.18 (tested on 1.18.33)
+- no dependencies — the plugin is a single TypeScript file (type-only import)
 
-## Instalacja
+## Installation
 
-Wtyczkę można zainstalować dla jednego projektu albo globalnie:
+The plugin can be installed for a single project or globally:
 
-1. Skopiuj plik wtyczki z tego repozytorium:
-   - per projekt:
+1. Copy the plugin file from this repository:
+   - per project:
 
      ```sh
-     cp .opencode/plugins/auto-executor.ts <projekt>/.opencode/plugins/auto-executor.ts
+     cp .opencode/plugins/auto-executor.ts <project>/.opencode/plugins/auto-executor.ts
      ```
 
-   - globalnie:
+   - globally:
 
      ```sh
      mkdir -p ~/.config/opencode/plugins
      cp .opencode/plugins/auto-executor.ts ~/.config/opencode/plugins/auto-executor.ts
      ```
 
-2. Zrestartuj opencode (serwer/TUI).
-3. Weryfikacja: komendy `/auto-exec` i `/stop-auto-execution` powinny być widoczne
-   (w TUI po wpisaniu `/`), a log serwera powinien zawierać
-   `zarejestrowano komendy /auto-exec, /stop-auto-execution; narzędzie handoff_save zawsze widoczne, próg: max_context w execute()`.
+2. Restart opencode (server/TUI).
+3. Verification: the `/auto-exec` and `/stop-auto-execution` commands should be visible
+   (in the TUI after typing `/`), and the server log should contain
+   `zarejestrowano komendy /auto-exec, /stop-auto-execution; narzędzie handoff_save zawsze widoczne, próg: max_context w execute()` (this log line is emitted by the plugin in Polish).
 
-Plik `opencode.test.json` w tym repozytorium jest **wyłącznie testowy** (lokalne proxy
-lemonade/openrouter) — **nie kopiuj go** podczas wdrożenia. Wtyczka ładuje się
-automatycznie z `.opencode/plugins/`; nie wymaga żadnych wpisów w `opencode.json`.
+The `opencode.test.json` file in this repository is **for testing only** (a local
+lemonade/openrouter proxy) — **do not copy it** when deploying. The plugin loads
+automatically from `.opencode/plugins/`; it does not require any entries in `opencode.json`.
 
-## Użycie
+## Usage
 
 ```
-/auto-exec <ścieżka-do-pliku.json>     # start sekwencji kroków
-/stop-auto-execution                   # przerwanie bieżącego biegu
+/auto-exec <path-to-json-file>         # start the step sequence
+/stop-auto-execution                   # interrupt the current run
 ```
 
-Komendy sterują wtyczką — nie są wysyłane do modelu (tura LLM komendy jest celowo anulowana).
-Przykładowy plik konfiguracyjny: [`auto-exec.example.json`](auto-exec.example.json).
+The commands control the plugin — they are not sent to the model (the command's LLM turn is intentionally cancelled).
+Example configuration file: [`auto-exec.example.json`](auto-exec.example.json).
 
-## Plik konfiguracyjny (JSON)
+## Configuration file (JSON)
 
 ```json
 {
-  "prompt":      "tekst zadania, musi zawierać znacznik {step}",
-  "from":        1,          // pierwszy krok (domyślnie 1)
-  "to":          10,         // ostatni krok
-  "max_context": 60000,      // próg kontekstu w tokenach (wymagany, > 0)
-  "model":       "provider/model-id",  // opcjonalnie; domyślnie model z bieżącego czatu
-  "agent":       "build",    // opcjonalnie; domyślnie agent z bieżącego czatu
-  "tool_description": "opis narzędzia handoff_save dla agenta",  // opcjonalny
-  "max_handoffs": 10,        // limit przekazów na krok (domyślnie 10)
-  "max_instruction_attempts": 5,  // limit instrukcji handoff na sesję (domyślnie 5)
-  "heartbeat_seconds": 45    // częstotliwość tętna w UI w sekundach (0 = wyłączone; domyślnie 45)
+  "prompt":      "task text, must contain the {step} placeholder",
+  "from":        1,          // first step (default: 1)
+  "to":          10,         // last step
+  "max_context": 60000,      // context threshold in tokens (required, > 0)
+  "model":       "provider/model-id",  // optional; defaults to the model of the current chat
+  "agent":       "build",    // optional; defaults to the agent of the current chat
+  "tool_description": "description of the handoff_save tool for the agent",  // optional
+  "max_handoffs": 10,        // handoff limit per step (default: 10)
+  "max_instruction_attempts": 5,  // handoff instruction limit per session (default: 5)
+  "heartbeat_seconds": 45    // UI heartbeat frequency in seconds (0 = disabled; default: 45)
 }
 ```
 
-- `{step}` w promptach jest podmieniane numerem kroku.
-- Bez pól `model`/`agent` wtyczka przejmuje **model i agenta wybrane w czacie**, z którego
-  wystawiono komendę `/auto-exec` (wartości z JSON mają pierwszeństwo).
-- Licznik kontekstu = `input + output + cache.read + cache.write` z ostatniej bezbłędnej
-  wiadomości assistant; sprawdzany **po zakończonej turze** oraz **w trakcie tury**
-  (zdarzenie `message.updated` niesie tokeny każdej zakończonej wiadomości assistant).
+- `{step}` in prompts is replaced with the step number.
+- Without the `model`/`agent` fields the plugin takes over **the model and agent selected in the chat**
+  from which the `/auto-exec` command was issued (values from the JSON take precedence).
+- The context counter = `input + output + cache.read + cache.write` from the last error-free
+  assistant message; checked **after a finished turn** and **during a turn**
+  (the `message.updated` event carries the tokens of each finished assistant message).
 
-## Jak działa handoff
+## How the handoff works
 
-Narzędzie `handoff_save` jest **zawsze widoczne** — wtyczka ani go nie ukrywa
-(`tools:false`), ani nie blokuje (`permission.deny`). Powody:
+The `handoff_save` tool is **always visible** — the plugin neither hides it
+(`tools:false`) nor blocks it (`permission.deny`). Reasons:
 
-- flaga `tools` w treści promptu **nie zmienia zestawu narzędzi trwającej tury**
-  (działa tylko dla nowej tury), więc ukrywanie uniemożliwiłoby przekazanie pracy
-  w trakcie tury i w turach ręcznych,
-- ukryte narzędzie byłoby niewidoczne również dla steeringu mid-turn.
+- the `tools` flag in the prompt content **does not change the tool set of an ongoing turn**
+  (it only takes effect for a new turn), so hiding it would make handing off work
+  mid-turn and in manual turns impossible,
+- a hidden tool would also be invisible to mid-turn steering.
 
-Przed spontanicznym wywołaniem chroni **próg w `execute()`**: narzędzie odmawia,
-dopóki kontekst sesji nie przekroczy `max_context` (porównywane są ostatnie znane
-zużycie tokenów ze zdarzeń `message.updated` oraz snapshot sesji — tokeny bieżącej
-wiadomości nie są jeszcze przypięte w momencie wykonywania narzędzia).
+Protection against spontaneous calls is provided by the **threshold in `execute()`**: the tool refuses
+until the session context exceeds `max_context` (the last known
+token usage from `message.updated` events and the session snapshot are compared — the tokens of the
+current message are not yet attached at the moment the tool executes).
 
-Próg jest pilnowany na dwóch poziomach:
+The threshold is enforced at two levels:
 
-1. **Po zakończonej turze** — jeśli kontekst > `max_context`, agent dostaje instrukcję
-   („Kończy Ci się okno kontekstowe. Wywołaj narzędzie handoff_save…") i ma opisać stan
-   pracy w argumencie `description`. Instrukcja jest **ponawiana** w kolejnych turach
-   (limit: `max_instruction_attempts`, domyślnie 5 prób na sesję).
-2. **W trakcie tury** — każda zakończona wiadomość assistant z tokenami > progu
-   wstrzykuje **steering**: prompt sterujący wysłany do trwającej tury
-   (`session.promptAsync` kolejkuję wiadomość do bieżącej tury) — agent widzi go
-   natychmiast i może wykonać handoff bez kończenia tury. Steerowanie jest deduplikowane
-   (jedno na wiadomość) i korzysta z tego samego licznika prób co ścieżka post-turn.
-   Po wyczerpaniu `max_instruction_attempts` dalsze przekroczenia progu **przerywają turę**
-   (`session.abort`) — to zapobiega super-długim sesjom, których nie da się uratować.
+1. **After a finished turn** — if the context > `max_context`, the agent gets an instruction
+   ("You are running out of context window. Call the handoff_save tool…") and must describe the state
+   of the work in the `description` argument. The instruction is **repeated** in subsequent turns
+   (limit: `max_instruction_attempts`, default 5 attempts per session).
+2. **During a turn** — every finished assistant message with tokens above the threshold
+   injects **steering**: a steering prompt sent into the ongoing turn
+   (`session.promptAsync` queues a message into the current turn) — the agent sees it
+   immediately and can perform the handoff without finishing the turn. Steering is deduplicated
+   (one per message) and uses the same attempt counter as the post-turn path.
+   After `max_instruction_attempts` is exhausted, further threshold exceedances **abort the turn**
+   (`session.abort`) — this prevents super-long sessions that cannot be rescued.
 
-Po przerwanej turze (abort) pozostaje **ostatnia szansa**: jedna czysta tura z instrukcją
-handoff („OSTATNIA SZANSA…"), w której handler mid-turn nie ingeruje — model w czystej
-turze nie może ukryć się za „dokończę najpierw bieżącą pracę". Jeśli i to zawiedzie,
-krok kończy się z ostrzeżeniem.
+After an aborted turn (abort) there is still a **last chance**: one clean turn with the handoff
+instruction ("LAST CHANCE…"), in which the mid-turn handler does not interfere — a model in a clean
+turn cannot hide behind "I'll finish my current work first". If that fails too,
+the step ends with a warning.
 
-Wywołanie `handoff_save` tworzy nową sesję `[auto-exec] krok N/M — kontynuacja K`
-z promptem początkowym + „Co zrobiono dotychczas: {description}". Turę kontynuacji
-wtyczka odpala **bez czekania na jej zakończenie** (fire-and-forget) — koniec tury
-obsługuje pętla monitorująca przez mechanizm waiterów, a monitoring progu obejmuje
-sesję kontynuacji **od pierwszej wiadomości**. (Wcześniejsza wersja czekała w
-`execute()` na całą turę kontynuacji, co na ten czas wyłączało monitoring mid-turn —
-kontynuacja puchła bez steeringu, dopóki użytkownik ręcznie nie wymusił przekazu.)
-Łańcuch kontynuacji jest ograniczony `max_handoffs`; po osiągnięciu któregokolwiek
-limitu krok kończy się z ostrzeżeniem. `/stop-auto-execution` ustawia flagę stopu
-i przerywa aktywną turę agenta (`session.abort`).
+Calling `handoff_save` creates a new session `[auto-exec] step N/M — continuation K`
+with the initial prompt + "Progress so far: {description}". The plugin starts the continuation
+turn **without waiting for it to finish** (fire-and-forget) — the end of the turn
+is handled by the monitoring loop through the waiter mechanism, and threshold monitoring covers
+the continuation session **from the very first message**. (An earlier version waited in
+`execute()` for the whole continuation turn, which disabled mid-turn monitoring
+for that time —
+the continuation bloated without steering until the user manually forced the handoff.)
+The continuation chain is limited by `max_handoffs`; once either limit is reached,
+the step ends with a warning. `/stop-auto-execution` sets the stop flag
+and aborts the agent's active turn (`session.abort`).
 
-## Heartbeat (widoczność w UI)
+## Heartbeat (UI visibility)
 
-Wtyczka raportuje w TUI, że żyje — brak komunikatów oznacza, że wtyczka umarła:
+The plugin reports in the TUI that it is alive — no messages means the plugin has died:
 
-- **tętno okresowe** — co `heartbeat_seconds` (domyślnie 45 s) toast: bieżący krok,
-  numer kontynuacji i czas od ostatniej aktywności; `0` wyłącza tętno,
-- **odpalenie nowego taska** — toast przy tworzeniu sesji każdego kroku,
-- **koniec tury agenta** — toast po każdej zakończonej turze (`session.idle`),
-- **handoff** — toast przy tworzeniu sesji kontynuacji po wywołaniu `handoff_save`,
-- **koniec / stop / błąd biegu** — toasty `success` / `warning` / `error`.
+- **periodic heartbeat** — every `heartbeat_seconds` (default 45 s) a toast: the current step,
+  continuation number and time since last activity; `0` disables the heartbeat,
+- **new task started** — a toast when each step's session is created,
+- **agent turn finished** — a toast after each finished turn (`session.idle`),
+- **handoff** — a toast when a continuation session is created after `handoff_save` is called,
+- **run end / stop / error** — `success` / `warning` / `error` toasts.
 
-Wszystkie zdarzenia są też zapisywane w logu serwera (`client.app.log`,
-serwis `auto-executor`) — tam można zweryfikować działanie, gdy TUI nie jest
-podpięte (toasty trafiają wyłącznie do TUI).
+All events are also written to the server log (`client.app.log`,
+service `auto-executor`) — that is where you can verify the plugin's operation when the TUI is not
+attached (toasts go exclusively to the TUI).
 
-Uwaga: `/auto-exec` **wymaga argumentu** — ścieżki do pliku JSON. Wywołanie bez
-argumentu nic nie uruchamia (toast z użyciem + wpis w logu serwera).
+Note: `/auto-exec` **requires an argument** — the path to a JSON file. Calling it without
+an argument does not start anything (a toast with usage + an entry in the server log).
 
-## Uwagi
+## Notes
 
-- Komendy działają w zwykłych czatach; historia wszystkich sesji kroków jest zachowana
-  (tytuły sesji mają prefiks `[auto-exec]`).
-- Model musi poprawnie wywoływać narzędzia. Modele ignorujące listę narzędzi (np. lokalny
-  lemonade/Qwen3.8 w niektórych wersjach) mogą nie wykonać handoffu — to wada modelu,
-  nie wtyczki.
-- Testowy przebieg E2E (opencode 1.18.33, model GLM 5.3 Flash, degenerowany przypadek
-  `max_context=1`) wykonał pełny łańcuch mid-turn: 2× steering w trakcie tury → handoff
-  **przed końcem tury** → kontynuacja z przekazem → instrukcja post-turn → kolejne handoffy
-  → limit `max_handoffs` → koniec kroku. Wariant z wyczerpaniem prób przeszedł ścieżkę
-  abort → „ostatnia szansa".
+- The commands work in regular chats; the history of all step sessions is preserved
+  (session titles have the `[auto-exec]` prefix).
+- The model must call tools correctly. Models that ignore the tool list (e.g. the local
+  lemonade/Qwen3.8 in some versions) may fail to perform the handoff — that is a model flaw,
+  not a plugin flaw.
+- An E2E test run (opencode 1.18.33, GLM 5.3 Flash model, degenerate case
+  `max_context=1`) executed the full mid-turn chain: 2× steering during the turn → handoff
+  **before the end of the turn** → continuation with the handoff → post-turn instruction → further handoffs
+  → the `max_handoffs` limit → end of step. The variant with exhausted attempts went through the
+  abort → "last chance" path.
 
-## Testy i development
+## Tests and development
 
-- `opencode.test.json` — konfiguracja testowa (lokalne proxy lemonade/openrouter).
-  Testowy serwer opencode należy odpalać z katalogu zawierającego `.opencode/plugins/`
-  i ten config (`opencode serve` instancjuje się w katalogu bieżącym).
-- Typecheck (potrzebne typy `@opencode-ai/plugin` — wtyczka w runtime ich nie wymaga):
+- `opencode.test.json` — test configuration (local lemonade/openrouter proxy).
+  The test opencode server should be started from the directory containing `.opencode/plugins/`
+  and this config (`opencode serve` instantiates itself in the current directory).
+- Typecheck (the `@opencode-ai/plugin` types are needed — the plugin does not require them at runtime):
 
   ```sh
   cd .opencode
@@ -168,10 +169,10 @@ argumentu nic nie uruchamia (toast z użyciem + wpis w logu serwera).
     --module esnext --moduleResolution bundler plugins/auto-executor.ts
   ```
 
-  Baseline zawiera ~11 „szumowych" błędów (TS2554 — dwuargumentowe wywołania klienta,
-  TS7006/7031 — implicit any, TS2322 — Plugin non-async, TS2591 — brak @types/node);
-  kod działa poprawnie pod bunem.
+  The baseline contains ~11 "noise" errors (TS2554 — two-argument client calls,
+  TS7006/7031 — implicit any, TS2322 — Plugin non-async, TS2591 — missing @types/node);
+  the code works correctly under bun.
 
-## Licencja
+## License
 
 [MIT](LICENSE)

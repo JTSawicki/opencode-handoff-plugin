@@ -1,48 +1,48 @@
-// auto-executor — wtyczka opencode
+// auto-executor — an opencode plugin
 //
-// Sekwencyjne wykonywanie kroków: każda iteracja pętli for w LaTeX-u pisze
-// jedno zdanie sprawozdania. Wtyczka uruchamia nową sesję czatu dla każdego
-// kroku, czeka aż agent skończy, po czym przechodzi do następnego kroku.
+// Sequential step execution: each iteration of a for loop in LaTeX writes
+// one sentence of a report. The plugin starts a new chat session for each
+// step, waits until the agent finishes, and then moves on to the next step.
 //
-// Komendy:
-//   /auto-exec <sciezka-do-pliku.json>  – start sekwencji kroków
-//   /stop-auto-execution                – wymuszone przerwanie działania
+// Commands:
+//   /auto-exec <path-to-json-file>  – start the step sequence
+//   /stop-auto-execution            – force-stop the run
 //
-// Plik konfiguracyjny (JSON):
+// Configuration file (JSON):
 // {
-//   "prompt":      "tekst promptu z polem {step} na numer kroku",
-//   "from":        1,          // pierwszy krok (opcjonalnie, domyślnie 1)
-//   "to":          10,         // ostatni krok
-//   "max_context": 60000,      // próg kontekstu w tokenach
-//   "model":       "provider/model-id",   // opcjonalnie; domyślnie model wybrany w czacie
-//   "agent":       "build",               // opcjonalnie; domyślnie agent z bieżącego czatu
-//   "tool_description": "..."  // opcjonalny opis narzędzia przekazywany agentowi
-//   "max_handoffs": 10         // opcjonalny limit przekazów na krok
-//   "max_instruction_attempts": 5  // opcjonalny limit ponowień instrukcji handoff na sesję
-//   "heartbeat_seconds": 45    // opcjonalna częstotliwość tętna w UI (0 = wyłączone)
+//   "prompt":      "prompt text with a {step} placeholder for the step number",
+//   "from":        1,          // first step (optional, default 1)
+//   "to":          10,         // last step
+//   "max_context": 60000,      // context threshold in tokens
+//   "model":       "provider/model-id",   // optional; defaults to the model selected in the chat
+//   "agent":       "build",               // optional; defaults to the agent of the current chat
+//   "tool_description": "..."  // optional description of the tool passed to the agent
+//   "max_handoffs": 10         // optional handoff limit per step
+//   "max_instruction_attempts": 5  // optional limit of handoff instruction retries per session
+//   "heartbeat_seconds": 45    // optional UI heartbeat frequency (0 = disabled)
 // }
 //
-// Heartbeat: wtyczka raportuje w TUI (toastami), że żyje — tętno co
-// heartbeat_seconds oraz komunikaty przy każdym istotnym zdarzeniu:
-// odpalenie nowego taska (kroku), zakończenie tury agenta, handoff,
-// zakończenie/błąd biegu. Brak tętna = wtyczka umarła.
+// Heartbeat: the plugin reports (via toasts) in the TUI that it is alive — a heartbeat
+// every heartbeat_seconds plus messages on every significant event:
+// a new task (step) started, an agent turn finished, a handoff,
+// run finished/error. No heartbeat = the plugin has died.
 //
-// Gdy w trakcie kroku zużycie kontekstu przekroczy max_context, agent dostaje
-// komunikat i wywołuje narzędzie handoff_save, które uruchamia nową konwersację
-// (początkowy prompt + "Co zrobiono dotychczas: <opis agenta>"). Turę kontynuacji
-// wtyczka odpala bez czekania na jej koniec (fire-and-forget) — dzięki temu
-// monitoring progu obejmuje sesję kontynuacji od pierwszej wiadomości (dawniej
-// execute() czekał na całą turę kontynuacji i przez ten czas wyłączał monitoring
-// mid-turn: kontynuacja 1 kroku T8 puchła do ~184k tokenów bez steeringu).
-// Narzędzie handoff_save jest ZAWSZE widoczne (nie ukrywamy go ani permission.deny,
-// ani flagą tools — flaga wiadomości steeringowej nie zmienia zestawu narzędzi
-// trwającej tury, a ukrywanie blokowałoby przekazanie pracy mid-turn). Przed
-// spontanicznym wywołaniem chroni próg: execute() odmawia, dopóki kontekst sesji
-// nie przekroczy max_context. Próg jest pilnowany również W TRAKCIE tury
-// (message.updated): przekroczenie wstrzykuje prompt sterujący z prośbą o handoff;
-// po wyczerpaniu max_instruction_attempts tura jest przerywana, żeby nie powstawały
-// super-długie sesje. Jeśli agent mimo to nie przekaże pracy, instrukcja jest
-// ponawiana po zakończeniu tury (ten sam licznik prób).
+// When context usage during a step exceeds max_context, the agent receives
+// a message and calls the handoff_save tool, which starts a new conversation
+// (initial prompt + "Progress so far: <agent's description>"). The plugin starts the
+// continuation turn without waiting for it to finish (fire-and-forget) — thanks to this
+// threshold monitoring covers the continuation session from its first message (previously
+// execute() waited for the whole continuation turn and meanwhile disabled mid-turn
+// monitoring: the continuation of step 1 of run T8 bloated to ~184k tokens without steering).
+// The handoff_save tool is ALWAYS visible (we hide it neither with permission.deny
+// nor with the tools flag — the steering message's flag does not change the tool set
+// of an ongoing turn, and hiding it would block handing off work mid-turn). Protection
+// against spontaneous calls is provided by the threshold: execute() refuses until the
+// session context exceeds max_context. The threshold is also enforced DURING the turn
+// (message.updated): an exceedance injects a steering prompt asking for a handoff;
+// once max_instruction_attempts is exhausted the turn is aborted, so that
+// super-long sessions do not appear. If the agent still does not hand off the work,
+// the instruction is repeated after the turn ends (same attempt counter).
 
 import type { Plugin } from "@opencode-ai/plugin"
 import fs from "node:fs"
@@ -67,9 +67,9 @@ type RunConfig = {
   heartbeat_seconds?: number
 }
 
-// Uzupełnia konfigurację domyślnymi model/agent przejętymi z sesji kontrolnej
-// (czyli z czatu, w którym użytkownik wpisał /auto-exec). Wartości podane
-// jawnie w pliku JSON mają pierwszeństwo.
+// Fills in the configuration with default model/agent taken over from the control session
+// (i.e. the chat in which the user typed /auto-exec). Values given
+// explicitly in the JSON file take precedence.
 async function resolveDefaults(
   client: any,
   controllerSessionID: string,
@@ -90,7 +90,7 @@ async function resolveDefaults(
       cfg.agent = info.agent
     }
   } catch {
-    // brak dostępu do sesji kontrolnej — zostają domyślne ustawienia serwera
+    // no access to the control session — the server defaults remain
   }
 }
 
@@ -105,14 +105,14 @@ type RunState = {
   beatTimer: ReturnType<typeof setInterval> | null
   handledMsgs: Map<string, string>
   finalAttempts: Map<string, number>
-  // sesja z trwającą turą „ostatniej szansy" — handler mid-turn nie wolno jej
-  // przerywać ani steerować (próby już wyczerpane, abort ubiłby model, zanim
-  // zdążył wywołać narzędzie handoff — E2E diag2 r3)
+  // session with an ongoing "last chance" turn — the mid-turn handler must not
+  // abort or steer it (attempts already exhausted, the abort would kill the model before
+  // it managed to call the handoff tool — E2E diag2 r3)
   finalChance: string | null
-  // ostatnie znane zużycie tokenów per sesja (z message.updated). Wykonanie
-  // narzędzia dzieje się ZANIM bieżąca wiadomość dostanie tokeny (a po abort-cie
-  // jej tokeny są zerowane) — snapshot w execute() widzi wtedy 0 i odrzuca
-  // uprawniony handoff (E2E diag2 r4). Stąd guard używa max(snapshot, lastKnown).
+  // last known token usage per session (from message.updated). The tool
+  // executes BEFORE the current message gets its tokens (and after an abort
+  // its tokens are zeroed) — the snapshot in execute() then sees 0 and rejects
+  // a legitimate handoff (E2E diag2 r4). Hence the guard uses max(snapshot, lastKnown).
   lastTokens: Map<string, number>
 }
 
@@ -200,26 +200,26 @@ export const AutoExecutor: Plugin = (input, options) => {
     void client.tui.showToast({ body: { message, variant, duration } }).catch(() => {})
   }
 
-  // ── wysyłanie tury do sesji ───────────────────────────────────────────────
+  // ── sending a turn to a session ───────────────────────────────────────────
   function buildBody(text: string, allowHandoff: boolean): Record<string, unknown> {
     const body: Record<string, unknown> = {
       parts: [{ type: "text", text }],
     }
-    // Narzędzie jest zawsze widoczne — flaga tools w treści żądania NIE zmienia
-    // zestawu narzędzi trwającej tury (steering), a ukrywanie narzędzia (tools:false)
-    // blokowałoby przekazanie pracy mid-turn. Ustawiamy tools:true wyłącznie
-    // dla jawnych tur instrukcji (dokumentacja intencji).
+    // The tool is always visible — the tools flag in the request body does NOT change
+    // the tool set of an ongoing turn (steering), and hiding the tool (tools:false)
+    // would block handing off work mid-turn. We set tools:true solely
+    // for explicit instruction turns (to document the intent).
     if (allowHandoff) body.tools = { [toolName]: true }
     if (run?.cfg.model) body.model = parseModel(run.cfg.model)
     if (run?.cfg.agent) body.agent = run.cfg.agent
     return body
   }
 
-  // Odpala turę i NIE czeka na jej zakończenie — koniec tury obsłuży waiter,
-  // na który czeka monitorStep. Używane przez handoff: gdyby execute() czekał
-  // na całą turę kontynuacji, monitoring progu byłby zablokowany przez cały
-  // czas jej trwania (incydent T8/kontynuacja 1 — sesja puchła do ~184k
-  // tokenów bez steeringu, przekaz wymusił ręcznie użytkownik).
+  // Starts a turn and does NOT wait for it to finish — the turn end will be handled
+  // by the waiter that monitorStep waits on. Used by the handoff: if execute() waited
+  // for the whole continuation turn, threshold monitoring would be blocked for the
+  // entire duration of that turn (incident T8/continuation 1 — the session bloated to
+  // ~184k tokens without steering; the user forced the handoff manually).
   async function startTurn(sessionID: string, text: string, allowHandoff: boolean): Promise<void> {
     if (run) run.lastActivity = Date.now()
     const waiter = registerWaiter(sessionID)
@@ -236,9 +236,9 @@ export const AutoExecutor: Plugin = (input, options) => {
     }
   }
 
-  // steering=true: wiadomość wstrzykiwana do TRWAJĄCEJ tury (kolejka opencode).
-  // Nie rejestrujemy wtedy waitera — koniec tury i tak załatwi waiter tury
-  // pierwotnej; podwójna rejestracja unieważniłaby jego resolve.
+  // steering=true: the message is injected into an ONGOING turn (opencode queue).
+  // In that case we do not register a waiter — the turn end is handled anyway by
+  // the original turn's waiter; double registration would invalidate its resolve.
   async function sendTurn(sessionID: string, text: string, allowHandoff: boolean, steering = false) {
     if (run) run.lastActivity = Date.now()
     if (steering) {
@@ -292,18 +292,18 @@ export const AutoExecutor: Plugin = (input, options) => {
     }
   }
 
-  // ── stan sesji po zakończonej turze ───────────────────────────────────────
+  // ── session state after a finished turn ───────────────────────────────────
   type SessionSnapshot = { tokens: number; error?: { name?: string; message?: string } }
 
   async function snapshot(sessionID: string): Promise<SessionSnapshot> {
     const res: any = await client.session.messages({ path: { id: sessionID } }, { throwOnError: true } as any)
     const data = res?.data ?? res
     const list: Array<{ info: any }> = Array.isArray(data) ? data : (data?.messages ?? [])
-    // Ostatnia wiadomość assistant (dowolna) — z niej bierzemy error (do logiki
-    // przerwanych tur w monitorStep). Tokeny bierzemy z ostatniej BEZBŁĘDNEJ
-    // wiadomości assistant: przerwana tura (MessageAbortedError) jest zerowana
-    // (wszystkie tokeny = 0), co bez tego oszukiwało próg i uciszało ścieżkę
-    // „ostatniej szansy" po abort-cie (E2E diag2: krok kończył się po cichu).
+    // Last assistant message (any) — we take the error from it (for the aborted
+    // turn logic in monitorStep). Tokens are taken from the last ERROR-FREE
+    // assistant message: an aborted turn (MessageAbortedError) is zeroed
+    // (all tokens = 0), which otherwise cheated the threshold and silenced the
+    // "last chance" path after an abort (E2E diag2: the step ended silently).
     let last: any
     let lastHealthy: any
     for (let i = list.length - 1; i >= 0; i--) {
@@ -325,43 +325,43 @@ export const AutoExecutor: Plugin = (input, options) => {
 function instructionText(state: RunState, attempt: number, maxAttempts: number, final = false): string {
     const desc =
       state.cfg.tool_description ??
-      `Narzędzie służy do przekazania pracy do nowej konwersacji. W argumencie "description" opisz bardzo dokładnie: co zostało dotychczas zrobione, jakie były ustalenia, jakie pliki zmieniono i co jeszcze zostało do zrobienia w ramach bieżącego kroku. Po wywołaniu narzędzia Twoja praca zostanie kontynuowana w nowej konwersacji, która otrzyma ten opis wraz z pierwotnym zadaniem.`
+      `The tool is used to hand off the work to a new conversation. In the "description" argument describe in great detail: what has been done so far, what conclusions were reached, which files were changed and what still remains to be done within the current step. After the tool is called, your work will be continued in a new conversation that will receive this description along with the original task.`
     const lines: string[] = []
     if (final) {
       lines.push(
-        `OSTATNIA SZANSA: Twoja poprzednia tura została przerwana, bo kontekst (${state.cfg.max_context} tokenów) został przekroczony, a Ty nie przekazałeś pracy. To czysta tura — nie kontynuuj bieżącego zadania.`,
+        `LAST CHANCE: Your previous turn was aborted because the context (${state.cfg.max_context} tokens) was exceeded and you did not hand off the work. This is a clean turn — do not continue the current task.`,
       )
-      lines.push(`Wywołaj narzędzie ${toolName} TERAZ jako jedyną akcję w tej turze.`)
+      lines.push(`Call the ${toolName} tool NOW as the only action in this turn.`)
     } else {
-      lines.push(`Kończy Ci się okno kontekstowe. Wywołaj narzędzie ${toolName}. Opisz dokładnie co zrobiłeś i jakie masz ustalenia. Będziemy kontynuować w nowej konwersacji.`)
+      lines.push(`You are running out of context window. Call the ${toolName} tool. Describe in detail what you have done and what conclusions you have reached. We will continue in a new conversation.`)
     }
     lines.push(``)
-    lines.push(`Informacje o narzędzie ${toolName}:`)
+    lines.push(`Information about the ${toolName} tool:`)
     lines.push(desc)
     lines.push(``)
     if (attempt > 1 && !final) {
-      lines.push(`UWAGA: to ponowna prośba (próba ${attempt}/${maxAttempts}). W poprzedniej turze nie wywołałeś narzędzia ${toolName}.`)
+      lines.push(`NOTE: this is a repeated request (attempt ${attempt}/${maxAttempts}). You did not call the ${toolName} tool in the previous turn.`)
       lines.push(``)
     }
     lines.push(
       final
-        ? `W argumencie "description" przekaż pełny opis stanu pracy i nie wywołuj żadnych innych narzędzi.`
-        : `Wywołaj je teraz (jako jedyną akcję w tej turze) i przekaż w argumencie "description" pełny opis stanu pracy. Przestań wykonywać dalsze kroki zadania.`,
+        ? `In the "description" argument provide a full description of the state of the work and do not call any other tools.`
+        : `Call it now (as the only action in this turn) and provide a full description of the state of the work in the "description" argument. Stop executing further steps of the task.`,
     )
     return lines.join("\n")
   }
 
-  // ── tworzenie sesji ───────────────────────────────────────────────────────
+  // ── session creation ──────────────────────────────────────────────────────
   async function createSession(state: RunState, title: string): Promise<string> {
     const res: any = await client.session.create({ body: { title } }, { throwOnError: true } as any)
     const data = res?.data ?? res
     return data.id
   }
 
-  // ── narzędzie handoff ─────────────────────────────────────────────────────
-  const handoffDescription = `Zapisz przekaz dla nowej konwersacji, która będzie kontynuować bieżące zadanie. Wywołuj wyłącznie wtedy, gdy system wyraźnie o to poprosi (kończy się okno kontekstowe).`
+  // ── the handoff tool ──────────────────────────────────────────────────────
+  const handoffDescription = `Save a handover message for the new conversation that will continue the current task. Call it only when the system explicitly asks you to (the context window is running out).`
 
-  // ── główna pętla kroku ────────────────────────────────────────────────────
+  // ── main step loop ────────────────────────────────────────────────────────
   async function monitorStep(state: RunState, firstSessionID: string): Promise<void> {
     let sessionID = firstSessionID
     while (!state.stopping) {
@@ -386,9 +386,9 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
       const maxAttempts = state.cfg.max_instruction_attempts ?? DEFAULT_INSTRUCTION_ATTEMPTS
       const attempts = state.instructionAttempts.get(sessionID) ?? 0
       if (attempts >= maxAttempts) {
-        // Ostatnia szansa: jedna czysta tura instrukcji po przerwaniu długiej
-        // tury — w czystej turze model nie może ukryć się za "dokończę najpierw
-        // bieżącą pracę" (E2E: niemal 100% skuteczności w czystych turach).
+        // Last chance: one clean instruction turn after aborting a long
+        // turn — in a clean turn the model cannot hide behind "I'll finish my
+        // current work first" (E2E: nearly 100% success rate in clean turns).
         const finalDone = state.finalAttempts.get(sessionID) ?? 0
         if (finalDone < 1) {
           state.finalAttempts.set(sessionID, finalDone + 1)
@@ -503,9 +503,9 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
           template: `[auto-exec] ${STOP_COMMAND}`,
         }
       }
-      // NIE ustawiamy permission.deny i NIE ukrywamy narzędzia — musi być dostępne
-      // w każdej turze (w tym steeringowych i ręcznych), żeby handoff zadziałał
-      // mid-turn. Przed spontanicznym wywołaniem chroni próg w execute().
+      // We do NOT set permission.deny and we do NOT hide the tool — it must be available
+      // in every turn (including steering and manual ones) so that the handoff can
+      // happen mid-turn. The threshold in execute() protects against spontaneous calls.
       log("info", `zarejestrowano komendy /${START_COMMAND}, /${STOP_COMMAND}; narzędzie ${toolName} zawsze widoczne, próg: max_context w execute()`)
     },
 
@@ -515,20 +515,21 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
         if (!info || !run || run.stopping) return
         if (info.sessionID !== run.sessionID) return
         run.lastActivity = Date.now()
-        // Zapamiętujemy ostatnie znane zużycie tokenów (message.updated przychodzi
-        // wielokrotnie — max chroni przed częściowymi wartościami streamu). Wykorzystanie:
-        // guard w execute(), który w momencie wywołania narzędzia nie widzi jeszcze
-        // tokenów bieżącej wiadomości (patrz komentarz w RunState).
+        // We remember the last known token usage (message.updated arrives
+        // multiple times — max protects against partial stream values). Usage:
+        // the guard in execute(), which at tool call time does not yet see
+        // the tokens of the current message (see the comment in RunState).
         if (info.role === "assistant") {
           const tk = info.tokens ?? {}
           const total =
             (tk.input ?? 0) + (tk.output ?? 0) + (tk.cache?.read ?? 0) + (tk.cache?.write ?? 0)
           if (total > (run.lastTokens.get(info.sessionID) ?? 0)) run.lastTokens.set(info.sessionID, total)
         }
-        // Monitoring progu w TRAKCIE tury: każda zakończona wiadomość assistant
-        // (krok pętli LLM) niesie stan tokenów. Przekroczenie progu w długiej
-        // turze przerywa turę od razu — instrukcja handoff pójdzie w nowej turze,
-        // bez czekania na naturalny koniec (kiedy kontekst ucieka jeszcze dalej).
+        // Threshold monitoring DURING the turn: every finished assistant message
+        // (an iteration of the LLM loop) carries token state. Exceeding the threshold
+        // in a long turn aborts the turn right away — the handoff instruction will go
+        // in a new turn, without waiting for the natural end (when the context escapes
+        // even further).
         if (
           info.role === "assistant" &&
           waiters.has(info.sessionID) &&
@@ -537,17 +538,17 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
           const t = info.tokens ?? {}
           const total =
             (t.input ?? 0) + (t.output ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0)
-          // message.updated przychodzi wielokrotnie dla tej samej wiadomości —
-          // reagujemy tylko raz, na pierwsze zdarzenie z tokenami ponad próg.
+          // message.updated arrives multiple times for the same message —
+          // we react only once, on the first event with tokens above the threshold.
           const lastHandled = run.handledMsgs.get(info.sessionID)
           if (total > run.cfg.max_context && info.id !== lastHandled) {
             run.handledMsgs.set(info.sessionID, info.id)
             const maxAttempts = run.cfg.max_instruction_attempts ?? DEFAULT_INSTRUCTION_ATTEMPTS
             const attempts = run.instructionAttempts.get(info.sessionID) ?? 0
             if (attempts < maxAttempts) {
-              // Wstrzyknięcie steering do trwającej tury: prompt sterujący +
-              // narzędzie handoff (tools:true) — agent widzi jedno i drugie
-              // już w tej turze i może natychmiast przekazać pracę.
+              // Injecting steering into the ongoing turn: steering prompt +
+              // the handoff tool (tools:true) — the agent sees both
+              // in that very turn and can hand off the work immediately.
               run.instructionAttempts.set(info.sessionID, attempts + 1)
               log(
                 "info",
@@ -565,8 +566,8 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
                 true,
               ).catch(() => {})
             } else {
-              // Limit instrukcji wyczerpany, sesja dalej puchnie — ostateczność:
-              // przerywamy turę, żeby nie powstawała super-długa sesja.
+              // Instruction limit exhausted, the session keeps bloating — a last resort:
+              // we abort the turn so that a super-long session does not appear.
               log(
                 "warn",
                 `krok ${run.step}: limit instrukcji (${maxAttempts}) wyczerpany, kontekst ${total} > ${run.cfg.max_context} — przerywam turę`,
@@ -621,7 +622,7 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
           log("error", "failed to start run", { error: message })
           toast(`Auto-exec: ${message}`, "error", 10000)
         }
-        // Anulujemy wywołanie promptu — komenda służy tylko do sterowania wtyczką.
+        // We cancel the prompt call — the command only serves to control the plugin.
         throw new Error("auto-exec: handled by plugin (LLM turn intentionally cancelled)")
       }
       if (cmd.command === STOP_COMMAND) {
@@ -638,37 +639,37 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
           description: {
             type: "string",
             description:
-              "Bardzo dokładny opis: co zostało zrobione, jakie ustalenia podjęto, jakie pliki zmieniono, co pozostało do zrobienia.",
+              "A very detailed description: what has been done, what conclusions were reached, which files were changed, what remains to be done.",
           },
         },
         async execute(args, context) {
           const state = run
           if (!state || state.stopping) {
-            return "Błąd: automatyczne wykonywanie kroków nie jest aktywne — przekaz nie został zapisany."
+            return "Error: automatic step execution is not active — the handover was not saved."
           }
           if (context.sessionID !== state.sessionID) {
-            return "Błąd: przekaz dla tej konwersacji już został wykonany."
+            return "Error: the handover for this conversation has already been performed."
           }
-          // Zabezpieczenie przed spontanicznym wywołaniem: handoff wykonujemy
-          // wyłącznie po przekroczeniu progu kontekstu. Tokeny bieżącej wiadomości
-          // (tej z wywołaniem narzędzia) nie są jeszcze przypięte w momencie
-          // execute(), a wiadomość po abort-cie jest zerowana — dlatego bierzemy
-          // też ostatnie znane zużycie z message.updated (lastTokens).
+          // Protection against spontaneous calls: the handoff is executed
+          // only after the context threshold is exceeded. The tokens of the current
+          // message (the one with the tool call) are not yet attached at the moment
+          // of execute(), and a message after an abort is zeroed — therefore we also
+          // take the last known usage from message.updated (lastTokens).
           const snapNow = await snapshot(context.sessionID)
           const known = state.lastTokens.get(context.sessionID) ?? 0
           const seen = Math.max(snapNow.tokens, known)
           if (seen <= state.cfg.max_context) {
-            return `Błąd: próg kontekstu (${state.cfg.max_context} tokenów) jeszcze nie został przekroczony — kontekst: ${seen}. Nie wywołuj tego narzędzia, dopóki system o to wyraźnie nie poprosi.`
+            return `Error: the context threshold (${state.cfg.max_context} tokens) has not been exceeded yet — context: ${seen}. Do not call this tool until the system explicitly asks you to.`
           }
           const summary = String((args as any).description ?? "").trim()
           if (!summary) {
-            return "Błąd: argument \"description\" jest wymagany — opisz dokładnie co zostało zrobione."
+            return "Error: the \"description\" argument is required — describe in detail what has been done."
           }
           state.continuation++
           const title = `[auto-exec] krok ${state.step}/${state.cfg.to} — kontynuacja ${state.continuation}`
           const newSessionID = await createSession(state, title)
           const text =
-            renderPrompt(state.cfg.prompt, state.step) + `\n\nCo zrobiono dotychczas: ${summary}`
+            renderPrompt(state.cfg.prompt, state.step) + `\n\nProgress so far: ${summary}`
           state.sessionID = newSessionID
           state.lastActivity = Date.now()
           log("info", `krok ${state.step}: handoff → nowa konwersacja ${newSessionID}`)
@@ -679,21 +680,21 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
           )
           const prevSessionID = state.sessionID
           try {
-            // Fire-and-forget: bez czekania na koniec tury kontynuacji — waiter
-            // obsłuży monitorStep, a monitoring progu dla nowej sesji działa od
-            // razu. Czekanie tutaj wyłączałoby monitoring na cały czas trwania
-            // tury kontynuacji (incydent T8/kontynuacja 1).
+            // Fire-and-forget: without waiting for the end of the continuation turn — the
+            // waiter handles monitorStep, and threshold monitoring for the new session
+            // works right away. Waiting here would disable monitoring for the whole
+            // duration of the continuation turn (incident T8/continuation 1).
             await startTurn(newSessionID, text, false)
           } catch (error) {
-            // Cofamy stan, żeby ponowne wywołanie handoff_save w tej turze
-            // przeszło przez guard sessionID i próg jak za pierwszym razem.
+            // We roll back the state so that a repeated handoff_save call in this turn
+            // goes through the sessionID guard and the threshold like the first time.
             state.sessionID = prevSessionID
             state.continuation--
             const message = error instanceof Error ? error.message : String(error)
             log("warn", `krok ${state.step}: uruchomienie kontynuacji nie powiodło się: ${message}`)
-            return `Błąd: nie udało się uruchomić nowej konwersacji (${message}). Wywołaj ${toolName} ponownie.`
+            return `Error: failed to start the new conversation (${message}). Call ${toolName} again.`
           }
-          return "Nowa konwersacja została uruchomiona wraz z Twoim przekazem. Praca kontynuowana — zakończ tę wypowiedź krótkim podsumowaniem."
+          return "The new conversation has been started along with your handover. The work continues — finish this message with a short summary."
         },
       },
     },
