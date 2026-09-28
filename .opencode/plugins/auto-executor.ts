@@ -29,7 +29,11 @@
 //
 // Gdy w trakcie kroku zużycie kontekstu przekroczy max_context, agent dostaje
 // komunikat i wywołuje narzędzie handoff_save, które uruchamia nową konwersację
-// (początkowy prompt + "Co zrobiono dotychczas: <opis agenta>").
+// (początkowy prompt + "Co zrobiono dotychczas: <opis agenta>"). Turę kontynuacji
+// wtyczka odpala bez czekania na jej koniec (fire-and-forget) — dzięki temu
+// monitoring progu obejmuje sesję kontynuacji od pierwszej wiadomości (dawniej
+// execute() czekał na całą turę kontynuacji i przez ten czas wyłączał monitoring
+// mid-turn: kontynuacja 1 kroku T8 puchła do ~184k tokenów bez steeringu).
 // Narzędzie handoff_save jest ZAWSZE widoczne (nie ukrywamy go ani permission.deny,
 // ani flagą tools — flaga wiadomości steeringowej nie zmienia zestawu narzędzi
 // trwającej tury, a ukrywanie blokowałoby przekazanie pracy mid-turn). Przed
@@ -99,7 +103,6 @@ type RunState = {
   stopping: boolean
   lastActivity: number
   beatTimer: ReturnType<typeof setInterval> | null
-  handoffBusy: boolean
   handledMsgs: Map<string, string>
   finalAttempts: Map<string, number>
   // sesja z trwającą turą „ostatniej szansy" — handler mid-turn nie wolno jej
@@ -197,11 +200,8 @@ export const AutoExecutor: Plugin = (input, options) => {
     void client.tui.showToast({ body: { message, variant, duration } }).catch(() => {})
   }
 
-  // ── wysyłanie tury do sesji (bez blokowania) ──────────────────────────────
-  // steering=true: wiadomość wstrzykiwana do TRWAJĄCEJ tury (kolejka opencode).
-  // Nie rejestrujemy wtedy waitera — koniec tury i tak załatwi waiter tury
-  // pierwotnej; podwójna rejestracja unieważniłaby jego resolve.
-  async function sendTurn(sessionID: string, text: string, allowHandoff: boolean, steering = false) {
+  // ── wysyłanie tury do sesji ───────────────────────────────────────────────
+  function buildBody(text: string, allowHandoff: boolean): Record<string, unknown> {
     const body: Record<string, unknown> = {
       parts: [{ type: "text", text }],
     }
@@ -212,26 +212,48 @@ export const AutoExecutor: Plugin = (input, options) => {
     if (allowHandoff) body.tools = { [toolName]: true }
     if (run?.cfg.model) body.model = parseModel(run.cfg.model)
     if (run?.cfg.agent) body.agent = run.cfg.agent
-    if (run) run.lastActivity = Date.now()
+    return body
+  }
 
+  // Odpala turę i NIE czeka na jej zakończenie — koniec tury obsłuży waiter,
+  // na który czeka monitorStep. Używane przez handoff: gdyby execute() czekał
+  // na całą turę kontynuacji, monitoring progu byłby zablokowany przez cały
+  // czas jej trwania (incydent T8/kontynuacja 1 — sesja puchła do ~184k
+  // tokenów bez steeringu, przekaz wymusił ręcznie użytkownik).
+  async function startTurn(sessionID: string, text: string, allowHandoff: boolean): Promise<void> {
+    if (run) run.lastActivity = Date.now()
+    const waiter = registerWaiter(sessionID)
+    try {
+      await client.session
+        .promptAsync(
+          { path: { id: sessionID }, body: buildBody(text, allowHandoff) as any },
+          { throwOnError: true } as any,
+        )
+    } catch (error) {
+      if (isMine(sessionID, waiter.resolve)) waiters.delete(sessionID)
+      waiter.resolve()
+      throw error
+    }
+  }
+
+  // steering=true: wiadomość wstrzykiwana do TRWAJĄCEJ tury (kolejka opencode).
+  // Nie rejestrujemy wtedy waitera — koniec tury i tak załatwi waiter tury
+  // pierwotnej; podwójna rejestracja unieważniłaby jego resolve.
+  async function sendTurn(sessionID: string, text: string, allowHandoff: boolean, steering = false) {
+    if (run) run.lastActivity = Date.now()
     if (steering) {
       await client.session
-        .promptAsync({ path: { id: sessionID }, body: body as any }, { throwOnError: true } as any)
+        .promptAsync(
+          { path: { id: sessionID }, body: buildBody(text, allowHandoff) as any },
+          { throwOnError: true } as any,
+        )
         .catch((error: unknown) => {
           log("warn", `steering mid-turn nie dotarł: ${error instanceof Error ? error.message : String(error)}`)
         })
       return
     }
-
-    const { promise, resolve } = registerWaiter(sessionID)
-    try {
-      await client.session.promptAsync({ path: { id: sessionID }, body: body as any }, { throwOnError: true } as any)
-    } catch (error) {
-      if (isMine(sessionID, resolve)) waiters.delete(sessionID)
-      resolve()
-      throw error
-    }
-    await promise
+    await startTurn(sessionID, text, allowHandoff)
+    await waitTurn(sessionID)
   }
 
   function waitTurn(sessionID: string): Promise<void> {
@@ -431,7 +453,6 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
       stopping: false,
       lastActivity: Date.now(),
       beatTimer: null,
-      handoffBusy: false,
       handledMsgs: new Map(),
       finalAttempts: new Map(),
       finalChance: null,
@@ -511,7 +532,6 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
         if (
           info.role === "assistant" &&
           waiters.has(info.sessionID) &&
-          !run.handoffBusy &&
           run.finalChance !== info.sessionID
         ) {
           const t = info.tokens ?? {}
@@ -629,7 +649,7 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
           if (context.sessionID !== state.sessionID) {
             return "Błąd: przekaz dla tej konwersacji już został wykonany."
           }
-// Zabezpieczenie przed spontanicznym wywołaniem: handoff wykonujemy
+          // Zabezpieczenie przed spontanicznym wywołaniem: handoff wykonujemy
           // wyłącznie po przekroczeniu progu kontekstu. Tokeny bieżącej wiadomości
           // (tej z wywołaniem narzędzia) nie są jeszcze przypięte w momencie
           // execute(), a wiadomość po abort-cie jest zerowana — dlatego bierzemy
@@ -657,11 +677,21 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
             "info",
             8000,
           )
-          state.handoffBusy = true
+          const prevSessionID = state.sessionID
           try {
-            await sendTurn(newSessionID, text, false)
-          } finally {
-            state.handoffBusy = false
+            // Fire-and-forget: bez czekania na koniec tury kontynuacji — waiter
+            // obsłuży monitorStep, a monitoring progu dla nowej sesji działa od
+            // razu. Czekanie tutaj wyłączałoby monitoring na cały czas trwania
+            // tury kontynuacji (incydent T8/kontynuacja 1).
+            await startTurn(newSessionID, text, false)
+          } catch (error) {
+            // Cofamy stan, żeby ponowne wywołanie handoff_save w tej turze
+            // przeszło przez guard sessionID i próg jak za pierwszym razem.
+            state.sessionID = prevSessionID
+            state.continuation--
+            const message = error instanceof Error ? error.message : String(error)
+            log("warn", `krok ${state.step}: uruchomienie kontynuacji nie powiodło się: ${message}`)
+            return `Błąd: nie udało się uruchomić nowej konwersacji (${message}). Wywołaj ${toolName} ponownie.`
           }
           return "Nowa konwersacja została uruchomiona wraz z Twoim przekazem. Praca kontynuowana — zakończ tę wypowiedź krótkim podsumowaniem."
         },

@@ -115,10 +115,15 @@ turze nie może ukryć się za „dokończę najpierw bieżącą pracę". Jeśli
 krok kończy się z ostrzeżeniem.
 
 Wywołanie `handoff_save` tworzy nową sesję `[auto-exec] krok N/M — kontynuacja K`
-z promptem początkowym + „Co zrobiono dotychczas: {description}". Łańcuch kontynuacji
-jest ograniczony `max_handoffs`; po osiągnięciu któregokolwiek limitu krok kończy się
-z ostrzeżeniem. `/stop-auto-execution` ustawia flagę stopu i przerywa aktywną turę
-agenta (`session.abort`).
+z promptem początkowym + „Co zrobiono dotychczas: {description}". Turę kontynuacji
+wtyczka odpala **bez czekania na jej zakończenie** (fire-and-forget) — koniec tury
+obsługuje pętla monitorująca przez mechanizm waiterów, a monitoring progu obejmuje
+sesję kontynuacji **od pierwszej wiadomości**. (Wcześniejsza wersja czekała w
+`execute()` na całą turę kontynuacji, co na ten czas wyłączało monitoring mid-turn —
+kontynuacja puchła bez steeringu, dopóki użytkownik ręcznie nie wymusił przekazu.)
+Łańcuch kontynuacji jest ograniczony `max_handoffs`; po osiągnięciu któregokolwiek
+limitu krok kończy się z ostrzeżeniem. `/stop-auto-execution` ustawia flagę stopu
+i przerywa aktywną turę agenta (`session.abort`).
 
 ## Heartbeat (widoczność w UI)
 
