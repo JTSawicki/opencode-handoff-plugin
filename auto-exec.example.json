@@ -1,5 +1,5 @@
 {
-  "prompt": "This is step number {step}. Perform the following task: <enter the task for step {step} here>. If you received a handoff for an already completed step, simply finish your work instead of deciding, based on the handoff, that you will do the next step. Also do not hand off instructions for executing a step other than the one specified in this command.",
+  "prompt": "This is step number {step}. Perform the following task: <enter the task for step {step} here>. There is no user present, so don't ask any questions and work autonomously. Do not leave the project folder, as this requires additional permissions, and there is no one to give them to you. If you received a handoff for an already completed step, simply finish your work instead of deciding, based on the handoff, that you will do the next step. Also do not hand off instructions for executing a step other than the one specified in this command.",
   "from": 1,
   "to": 10,
   "max_context": 160000,
