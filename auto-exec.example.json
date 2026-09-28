@@ -2,7 +2,7 @@
   "prompt": "To jest krok numer {step}. Wykonaj następujące zadanie: <tu wpisz zadanie dla kroku {step}>. Jeżeli dostałeś przekazanie wykonanego już kroku to po prostu zakończ pracę, a nie decyduj na podstawie przekazania że będziesz robił następny krok. Nie przekazuj też instrukcji wykonania innego kroku niż w tym poleceniu.",
   "from": 1,
   "to": 10,
-  "max_context": 60000,
-  "max_handoffs": 10,
-  "heartbeat_seconds": 45
+  "max_context": 160000,
+  "max_handoffs": 5,
+  "heartbeat_seconds": 15
 }
