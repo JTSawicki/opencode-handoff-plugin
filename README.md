@@ -1,7 +1,7 @@
 # opencode-handoff-plugin
 
 **auto-executor** — wtyczka [opencode](https://opencode.ai), która sekwencyjnie wykonuje
-kroki zadania z pliku JSON: **jeden krok = jedna nowa sesja czatu**. Gdy w trakcie kroku
+kroki (muszisz je zapewnić opisane i ponumerowane w osobnym pliku MarkDown) zadania z pliku JSON: **jeden krok = jedna nowa sesja czatu**. Gdy w trakcie kroku
 zużycie kontekstu przekroczy próg, agent dostaje komunikat i wywołuje narzędzie
 `handoff_save`, co uruchamia **nową konwersację w ramach tego samego kroku**
 (prompt początkowy + „Co zrobiono dotychczas: {opis agenta}").
@@ -9,10 +9,8 @@ zużycie kontekstu przekroczy próg, agent dostaje komunikat i wywołuje narzęd
 ## Rozwój z udziałem AI
 
 Projekt powstał przy intensywnym wsparciu AI: **zdecydowana większość kodu wtyczki
-została napisana przez AI**. Człowiek pełnił rolę prowadzącego — definiował wymagania,
-decydował o zachowaniu wtyczki (steering mid-turn, „ostatnia szansa", limity),
-prowadził testy E2E i akceptował rozwiązania. Wtyczka była testowana z modelem
-**GLM 5.3 Flash** (opencode 1.18.33).
+została napisana przez AI**. 
+Wtyczka była testowana z modelem **GLM 5.3 Flash** (opencode 1.18.33).
 
 ## Wymagania
 
