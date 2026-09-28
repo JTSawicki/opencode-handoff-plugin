@@ -1,5 +1,5 @@
 {
-  "prompt": "To jest krok numer {step}. Wykonaj następujące zadanie: <tu wpisz zadanie dla kroku {step}>. Jeżeli dostałeś przekazanie wykonanego już kroku to po prostu zakończ pracę, a nie decyduj na podstawie przekazania że będziesz robił następny krok. Nie przekazuj też instrukcji wykonania innego kroku niż w tym poleceniu.",
+  "prompt": "This is step number {step}. Perform the following task: <enter the task for step {step} here>. If you received a handoff for an already completed step, simply finish your work instead of deciding, based on the handoff, that you will do the next step. Also do not hand off instructions for executing a step other than the one specified in this command.",
   "from": 1,
   "to": 10,
   "max_context": 160000,
