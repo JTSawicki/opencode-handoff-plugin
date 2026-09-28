@@ -1,0 +1,8 @@
+{
+  "prompt": "To jest krok numer {step}. Wykonaj następujące zadanie: <tu wpisz zadanie dla kroku {step}>.",
+  "from": 1,
+  "to": 10,
+  "max_context": 60000,
+  "max_handoffs": 10,
+  "heartbeat_seconds": 45
+}

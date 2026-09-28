@@ -1,0 +1,12 @@
+# Zależności i artefakty auto-generowane przez opencode (runtime wtyczki)
+node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+.opencode/bun.lock
+
+# Lokalna konfiguracja użytkownika (na bazie auto-exec.example.json)
+auto-exec.json
+
+# System / edytory
+.DS_Store
+*.log
