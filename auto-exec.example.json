@@ -4,5 +4,6 @@
   "to": 10,
   "max_context": 160000,
   "max_handoffs": 5,
+  "accumulate_handoffs": true,
   "heartbeat_seconds": 15
 }

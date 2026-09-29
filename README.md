@@ -4,7 +4,9 @@
 the steps of a task from a JSON file (you must provide the steps, described and numbered, in a separate MarkDown file): **one step = one new chat session**. If during a step
 the context usage exceeds the threshold, the agent gets a message and calls the
 `handoff_save` tool, which starts **a new conversation within the same step**
-(initial prompt + "Progress so far: {agent's description}").
+(original prompt + the descriptions of **all earlier handoffs of the step**, followed by the
+new one — handoffs accumulate within a step and are cleared at the start of the next step;
+toggle: `accumulate_handoffs`, default on).
 
 ## AI-assisted development
 
@@ -67,6 +69,7 @@ Example configuration file: [`auto-exec.example.json`](auto-exec.example.json).
   "tool_description": "description of the handoff_save tool for the agent",  // optional
   "max_handoffs": 10,        // handoff limit per step (default: 10)
   "max_instruction_attempts": 5,  // handoff instruction limit per session (default: 5)
+  "accumulate_handoffs": true,    // accumulate handoff descriptions within a step (default: true)
   "heartbeat_seconds": 45    // UI heartbeat frequency in seconds (0 = disabled; default: 45)
 }
 ```
@@ -113,8 +116,15 @@ turn cannot hide behind "I'll finish my current work first". If that fails too,
 the step ends with a warning.
 
 Calling `handoff_save` creates a new session `[auto-exec] step N/M — continuation K`
-with the initial prompt + "Progress so far: {description}". The plugin starts the continuation
-turn **without waiting for it to finish** (fire-and-forget) — the end of the turn
+with the original prompt + a `Progress so far` section containing the descriptions of **all
+handoffs made so far in this step** (numbered, in order; the accumulation resets at the start
+of the next step). When `accumulate_handoffs` is enabled (default), both the tool's own
+description and the handoff instructions carry a note about this accumulation (also appended
+to a custom `tool_description`), so the model knows the earlier descriptions are carried over
+and does not repeat their content — it describes only what happened since the last handoff.
+With `accumulate_handoffs: false` the plugin falls back to the previous behavior
+(`Progress so far: {description}` with only the newest handoff). The plugin starts the
+continuation turn **without waiting for it to finish** (fire-and-forget) — the end of the turn
 is handled by the monitoring loop through the waiter mechanism, and threshold monitoring covers
 the continuation session **from the very first message**. (An earlier version waited in
 `execute()` for the whole continuation turn, which disabled mid-turn monitoring
@@ -144,6 +154,12 @@ an argument does not start anything (a toast with usage + an entry in the server
 
 ## Notes
 
+- Handoff descriptions accumulate within a step (toggle: `accumulate_handoffs`, default on),
+  so each continuation starts with a longer base prompt — the accumulated text counts toward
+  the new session's context. If the base
+  alone exceeds `max_context`, every continuation immediately triggers the next handoff
+  (bounded by `max_handoffs`, so the step ends with a warning); in that case raise
+  `max_context` or shorten the handoff descriptions.
 - The commands work in regular chats; the history of all step sessions is preserved
   (session titles have the `[auto-exec]` prefix).
 - The model must call tools correctly. Models that ignore the tool list (e.g. the local

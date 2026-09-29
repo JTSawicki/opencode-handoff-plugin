@@ -20,6 +20,7 @@
 //   "max_handoffs": 10         // optional handoff limit per step
 //   "max_instruction_attempts": 5  // optional limit of handoff instruction retries per session
 //   "heartbeat_seconds": 45    // optional UI heartbeat frequency (0 = disabled)
+//   "accumulate_handoffs": true  // optional; handoff descriptions accumulate within a step (default true)
 // }
 //
 // Heartbeat: the plugin reports (via toasts) in the TUI that it is alive — a heartbeat
@@ -29,7 +30,9 @@
 //
 // When context usage during a step exceeds max_context, the agent receives
 // a message and calls the handoff_save tool, which starts a new conversation
-// (initial prompt + "Progress so far: <agent's description>"). The plugin starts the
+// (original prompt + the descriptions of ALL earlier handoffs of the step, then the
+// new one — handoffs accumulate within a step, toggle "accumulate_handoffs", default true,
+// and are cleared at the step change). The plugin starts the
 // continuation turn without waiting for it to finish (fire-and-forget) — thanks to this
 // threshold monitoring covers the continuation session from its first message (previously
 // execute() waited for the whole continuation turn and meanwhile disabled mid-turn
@@ -65,6 +68,7 @@ type RunConfig = {
   max_handoffs?: number
   max_instruction_attempts?: number
   heartbeat_seconds?: number
+  accumulate_handoffs?: boolean
 }
 
 // Fills in the configuration with default model/agent taken over from the control session
@@ -98,6 +102,10 @@ type RunState = {
   cfg: RunConfig
   step: number
   continuation: number
+  // descriptions of the handoffs made in the current step — they accumulate
+  // within the step (the continuation prompt contains all of them) and are
+  // cleared at the start of the next step
+  handoffSummaries: string[]
   sessionID: string
   instructionAttempts: Map<string, number>
   stopping: boolean
@@ -158,6 +166,8 @@ function loadConfig(raw: string): RunConfig {
       json.max_instruction_attempts !== undefined ? Number(json.max_instruction_attempts) : undefined,
     heartbeat_seconds:
       json.heartbeat_seconds !== undefined ? Number(json.heartbeat_seconds) : undefined,
+    accumulate_handoffs:
+      json.accumulate_handoffs !== undefined ? Boolean(json.accumulate_handoffs) : undefined,
   }
 
   if (!cfg.prompt) throw new Error(`plik ${file}: brak pola "prompt"`)
@@ -176,6 +186,8 @@ function loadConfig(raw: string): RunConfig {
     if (cfg.heartbeat_seconds > 0 && cfg.heartbeat_seconds < 5)
       throw new Error(`plik ${file}: "heartbeat_seconds" musi być 0 (wyłączone) albo >= 5`)
   }
+  if (json.accumulate_handoffs !== undefined && typeof json.accumulate_handoffs !== "boolean")
+    throw new Error(`plik ${file}: "accumulate_handoffs" musi być wartością logiczną (true/false)`)
   return cfg
 }
 
@@ -339,6 +351,10 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
     lines.push(`Information about the ${toolName} tool:`)
     lines.push(desc)
     lines.push(``)
+    if (state.cfg.accumulate_handoffs !== false) {
+      lines.push(accumulateNote)
+      lines.push(``)
+    }
     if (attempt > 1 && !final) {
       lines.push(`NOTE: this is a repeated request (attempt ${attempt}/${maxAttempts}). You did not call the ${toolName} tool in the previous turn.`)
       lines.push(``)
@@ -360,6 +376,10 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
 
   // ── the handoff tool ──────────────────────────────────────────────────────
   const handoffDescription = `Save a handover message for the new conversation that will continue the current task. Call it only when the system explicitly asks you to (the context window is running out).`
+  // Appended to the tool description (via the tool.definition hook) and to the handoff
+  // instructions ONLY when accumulate_handoffs is enabled — the tool description
+  // registered at startup cannot change per run, but the hook fires on every LLM step.
+  const accumulateNote = `Handoffs accumulate within a step: the new conversation receives the original task, then the descriptions of ALL earlier handoffs of this step (numbered, in order), then the newest one. Do not repeat their content — describe what has been done in the current conversation since the last handoff (for the first handoff: since the start of the step).`
 
   // ── main step loop ────────────────────────────────────────────────────────
   async function monitorStep(state: RunState, firstSessionID: string): Promise<void> {
@@ -415,6 +435,7 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
         if (state.stopping) break
         state.step = step
         state.continuation = 0
+        state.handoffSummaries = []
         const sessionID = await createSession(state, `[auto-exec] krok ${step}/${state.cfg.to}`)
         state.sessionID = sessionID
         log("info", `start kroku ${step}/${state.cfg.to} (sesja ${sessionID})`)
@@ -457,6 +478,7 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
       finalAttempts: new Map(),
       finalChance: null,
       lastTokens: new Map(),
+      handoffSummaries: [],
     }
     run = state
     const beatSeconds = cfg.heartbeat_seconds ?? DEFAULT_HEARTBEAT_SECONDS
@@ -605,6 +627,15 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
       }
     },
 
+    // The tool description registered in `tool` is a snapshot from plugin startup;
+    // this hook fires on every LLM step, so the accumulation note can follow the
+    // configuration of the active run (registry: tool/registry.ts → tools()).
+    "tool.definition": async (input: { toolID: string }, output: { description: string }) => {
+      if (input.toolID !== toolName) return
+      if (!run || run.stopping || run.cfg.accumulate_handoffs === false) return
+      output.description = `${output.description}\n\n${accumulateNote}`
+    },
+
     "command.execute.before": async (cmd) => {
       if (cmd.command === START_COMMAND) {
         try {
@@ -667,10 +698,17 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
             return "Error: the \"description\" argument is required — describe in detail what has been done."
           }
           state.continuation++
+          const accumulate = state.cfg.accumulate_handoffs !== false
+          if (accumulate) state.handoffSummaries.push(summary)
           const title = `[auto-exec] krok ${state.step}/${state.cfg.to} — kontynuacja ${state.continuation}`
           const newSessionID = await createSession(state, title)
-          const text =
-            renderPrompt(state.cfg.prompt, state.step) + `\n\nProgress so far: ${summary}`
+          const text = accumulate
+            ? renderPrompt(state.cfg.prompt, state.step) +
+              `\n\nProgress so far (${state.handoffSummaries.length} handoff${
+                state.handoffSummaries.length === 1 ? "" : "s"
+              } in this step, in order):\n\n` +
+              state.handoffSummaries.map((d, i) => `Handoff ${i + 1}:\n${d}`).join("\n\n")
+            : renderPrompt(state.cfg.prompt, state.step) + `\n\nProgress so far: ${summary}`
           state.sessionID = newSessionID
           state.lastActivity = Date.now()
           log("info", `krok ${state.step}: handoff → nowa konwersacja ${newSessionID}`)
@@ -691,6 +729,7 @@ function instructionText(state: RunState, attempt: number, maxAttempts: number, 
             // goes through the sessionID guard and the threshold like the first time.
             state.sessionID = prevSessionID
             state.continuation--
+            if (accumulate) state.handoffSummaries.pop()
             const message = error instanceof Error ? error.message : String(error)
             log("warn", `krok ${state.step}: uruchomienie kontynuacji nie powiodło się: ${message}`)
             return `Error: failed to start the new conversation (${message}). Call ${toolName} again.`
