@@ -12,34 +12,51 @@ toggle: `accumulate_handoffs`, default on).
 
 This project was created with heavy AI support: **the vast majority of the plugin
 code was written by AI**.
-The plugin was tested with the **GLM 5.3 Flash** model (opencode 1.18.33).
+The plugin was tested with the **GLM 5.3 Flash** model (opencode 2.0.23).
 
 ## Requirements
 
-- opencode ≥ 1.18 (tested on 1.18.33)
-- no dependencies — the plugin is a single TypeScript file (type-only import)
+- opencode ≥ 2.0 (tested on 2.0.23) — the plugin uses the v2 plugin API
+  (`Plugin.define`, context domains, plugin RPC, TUI companion plugins);
+  it is **not** compatible with opencode 1.x
+- no runtime dependencies in the plugin code itself, but opencode does **not**
+  auto-install the `@opencode/plugin` import — an explicit dependency in
+  `.opencode/package.json` + `npm install` is required (see Installation)
 
 ## Installation
 
-The plugin can be installed for a single project or globally:
+The plugin is a directory of three TypeScript files (server plugin, shared RPC
+definition, TUI companion). It can be installed for a single project or globally:
 
-1. Copy the plugin file from this repository:
+1. Copy the plugin directory from this repository:
    - per project:
 
      ```sh
-     cp .opencode/plugins/auto-executor.ts <project>/.opencode/plugins/auto-executor.ts
+     mkdir -p <project>/.opencode/plugins
+     cp -r .opencode/plugins/auto-executor <project>/.opencode/plugins/auto-executor
      ```
 
    - globally:
 
      ```sh
      mkdir -p ~/.config/opencode/plugins
-     cp .opencode/plugins/auto-executor.ts ~/.config/opencode/plugins/auto-executor.ts
+     cp -r .opencode/plugins/auto-executor ~/.config/opencode/plugins/auto-executor
      ```
 
-2. Restart opencode (server/TUI).
-3. Verification: the `/auto-exec` and `/stop-auto-execution` commands should be visible
-   (in the TUI after typing `/`), and the server log should contain
+2. Make `@opencode/plugin` resolvable. opencode does not auto-install plugin
+   imports, so the plugin directory needs a package dependency next to it
+   (per project; for a global install run the same in the opencode config
+   directory):
+
+   ```sh
+   cd <project>/.opencode
+   printf '{"dependencies":{"@opencode/plugin":"2.0.23"}}\n' > package.json
+   npm install
+   ```
+
+3. Restart opencode (server/TUI).
+4. Verification: `opencode plugin list` (from the project directory) should
+   show `auto-executor local`, and the server log should contain
    `zarejestrowano komendy /auto-exec, /stop-auto-execution; narzędzie handoff_save zawsze widoczne, próg: max_context w execute()` (this log line is emitted by the plugin in Polish).
 
 The `opencode.test.json` file in this repository is **for testing only** (a local
@@ -53,7 +70,9 @@ automatically from `.opencode/plugins/`; it does not require any entries in `ope
 /stop-auto-execution                   # interrupt the current run
 ```
 
-The commands control the plugin — they are not sent to the model (the command's LLM turn is intentionally cancelled).
+The commands control the plugin — they are not sent to the model. In v2 the
+commands have their own `execute` handlers (registered via `ctx.command.transform`),
+so no LLM prompt is ever submitted and there is nothing to cancel.
 Example configuration file: [`auto-exec.example.json`](auto-exec.example.json).
 
 ## Configuration file (JSON)
@@ -79,7 +98,8 @@ Example configuration file: [`auto-exec.example.json`](auto-exec.example.json).
   from which the `/auto-exec` command was issued (values from the JSON take precedence).
 - The context counter = `input + output + cache.read + cache.write` from the last error-free
   assistant message; checked **after a finished turn** and **during a turn**
-  (the `message.updated` event carries the tokens of each finished assistant message).
+  (the `session.usage.updated` event carries the cumulative token usage of the session,
+  supplemented by `session.step.ended`/`session.step.failed`).
 
 ## How the handoff works
 
@@ -93,7 +113,7 @@ The `handoff_save` tool is **always visible** — the plugin neither hides it
 
 Protection against spontaneous calls is provided by the **threshold in `execute()`**: the tool refuses
 until the session context exceeds `max_context` (the last known
-token usage from `message.updated` events and the session snapshot are compared — the tokens of the
+token usage from `session.usage.updated` events and the session snapshot are compared — the tokens of the
 current message are not yet attached at the moment the tool executes).
 
 The threshold is enforced at two levels:
@@ -102,13 +122,12 @@ The threshold is enforced at two levels:
    ("You are running out of context window. Call the handoff_save tool…") and must describe the state
    of the work in the `description` argument. The instruction is **repeated** in subsequent turns
    (limit: `max_instruction_attempts`, default 5 attempts per session).
-2. **During a turn** — every finished assistant message with tokens above the threshold
-   injects **steering**: a steering prompt sent into the ongoing turn
-   (`session.promptAsync` queues a message into the current turn) — the agent sees it
+2. **During a turn** — every token-usage update above the threshold injects **steering**: a steering prompt sent into the ongoing turn
+   (`ctx.session.prompt` delivers the message into the current turn) — the agent sees it
    immediately and can perform the handoff without finishing the turn. Steering is deduplicated
-   (one per message) and uses the same attempt counter as the post-turn path.
+   (one per step of the agent loop; released on the next step end) and uses the same attempt counter as the post-turn path.
    After `max_instruction_attempts` is exhausted, further threshold exceedances **abort the turn**
-   (`session.abort`) — this prevents super-long sessions that cannot be rescued.
+   (`ctx.session.interrupt`) — this prevents super-long sessions that cannot be rescued.
 
 After an aborted turn (abort) there is still a **last chance**: one clean turn with the handoff
 instruction ("LAST CHANCE…"), in which the mid-turn handler does not interfere — a model in a clean
@@ -132,7 +151,7 @@ for that time —
 the continuation bloated without steering until the user manually forced the handoff.)
 The continuation chain is limited by `max_handoffs`; once either limit is reached,
 the step ends with a warning. `/stop-auto-execution` sets the stop flag
-and aborts the agent's active turn (`session.abort`).
+and aborts the agent's active turn (`ctx.session.interrupt`).
 
 ## Heartbeat (UI visibility)
 
@@ -145,9 +164,17 @@ The plugin reports in the TUI that it is alive — no messages means the plugin 
 - **handoff** — a toast when a continuation session is created after `handoff_save` is called,
 - **run end / stop / error** — `success` / `warning` / `error` toasts.
 
-All events are also written to the server log (`client.app.log`,
-service `auto-executor`) — that is where you can verify the plugin's operation when the TUI is not
-attached (toasts go exclusively to the TUI).
+In opencode v2 the server-side plugin context has no TUI access (the v1
+`client.tui.showToast` is gone), so toasts are published as `toast` events of the
+`auto-executor` plugin RPC (defined in `rpc.ts`). The companion TUI plugin
+(`tui.ts`, loaded automatically from the same plugin directory) subscribes to
+those events and renders them as native TUI toasts. Without a TUI attached the
+events are simply dropped — the run keeps going, only nothing is displayed.
+
+All events are also written to the server log as plain `console.log`/`warn`/`error`
+lines with the `[auto-executor]` prefix (they land in
+`~/.local/share/opencode/log/opencode.log`) — that is where you can verify the
+plugin's operation when the TUI is not attached.
 
 Note: `/auto-exec` **requires an argument** — the path to a JSON file. Calling it without
 an argument does not start anything (a toast with usage + an entry in the server log).
@@ -166,28 +193,36 @@ an argument does not start anything (a toast with usage + an entry in the server
   lemonade/Qwen3.8 in some versions) may fail to perform the handoff — that is a model flaw,
   not a plugin flaw.
 - An E2E test run (opencode 1.18.33, GLM 5.3 Flash model, degenerate case
-  `max_context=1`) executed the full mid-turn chain: 2× steering during the turn → handoff
+  `max_context=1`) executed the full mid-turn chain on the v1 implementation: 2× steering during the turn → handoff
   **before the end of the turn** → continuation with the handoff → post-turn instruction → further handoffs
   → the `max_handoffs` limit → end of step. The variant with exhausted attempts went through the
-  abort → "last chance" path.
+  abort → "last chance" path. The v2 port reproduces this behavior with the v2 event/API
+  equivalents (see "Tests and development" for the v2 verification status).
 
 ## Tests and development
 
 - `opencode.test.json` — test configuration (local lemonade/openrouter proxy).
   The test opencode server should be started from the directory containing `.opencode/plugins/`
   and this config (`opencode serve` instantiates itself in the current directory).
-- Typecheck (the `@opencode-ai/plugin` types are needed — the plugin does not require them at runtime):
+- Typecheck (the `@opencode/plugin` types are needed — the plugin does not require them at runtime;
+  they are installed by the `.opencode/package.json` step from Installation):
 
   ```sh
   cd .opencode
-  npm i @opencode-ai/plugin
-  npx -y -p typescript tsc --noEmit --skipLibCheck --strict --target es2022 \
-    --module esnext --moduleResolution bundler plugins/auto-executor.ts
+  npx -y -p typescript@5.8.2 tsc --noEmit --skipLibCheck --strict --target es2022 \
+    --module esnext --moduleResolution bundler --allowImportingTsExtensions \
+    plugins/auto-executor/index.ts plugins/auto-executor/rpc.ts plugins/auto-executor/tui.ts
   ```
 
-  The baseline contains ~11 "noise" errors (TS2554 — two-argument client calls,
-  TS7006/7031 — implicit any, TS2322 — Plugin non-async, TS2591 — missing @types/node);
-  the code works correctly under bun.
+  All three files are passed explicitly (`tsc` does not accept a directory as a
+  command-line input). The v2 code is clean under `--strict` — 0 errors
+  (the v1 single-file version carried ~11 "noise" errors; the v2 rewrite removed them).
+
+- Runtime verification (opencode 2.0.23): the plugin loads from `.opencode/plugins/`
+  without any config entries, `opencode plugin list` shows `auto-executor local`,
+  and the `handoff_save` tool is registered and visible in the session's tool catalog.
+  The toast channel works via the plugin RPC (`rpc.ts`) rendered by the TUI companion
+  plugin (`tui.ts`).
 
 ## License
 
