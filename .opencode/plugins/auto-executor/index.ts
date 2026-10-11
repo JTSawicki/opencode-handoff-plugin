@@ -20,6 +20,7 @@
 //   "max_handoffs": 10         // optional handoff limit per step
 //   "max_instruction_attempts": 5  // optional limit of handoff instruction retries per session
 //   "heartbeat_seconds": 45    // optional UI heartbeat frequency (0 = disabled)
+//   "stall_timeout_seconds": 900  // optional; abort a turn that produced no events for this long (0 = disabled)
 //   "accumulate_handoffs": true  // optional; handoff descriptions accumulate within a step (default true)
 // }
 //
@@ -60,8 +61,12 @@
 //   NOT comparable to max_context — using it fired the handoff instruction
 //   after a few tool-call steps while the real context was still tiny
 //   (lemonade/Ornith-1.5: steering at ~14.5k real context, sum >120k);
-// - turn end = `session.idle`; aborted/failed turns are recognized via
-//   `session.execution.interrupted` / `session.execution.failed`,
+// - turn end = `session.execution.succeeded` (opencode >= 2.0.26 emits NO
+//   `session.idle` bus event — "idle" exists there only as a TUI command;
+//   waiting for it hung the run after the first finished turn); `session.idle`
+//   is kept as a fallback for older versions. Aborted/failed turns are
+//   recognized via `session.execution.interrupted` / `session.execution.failed`,
+//   and a stall watchdog aborts a turn that stopped producing events entirely,
 // - the V1 `tool.definition` hook became a `ctx.session.hook("context", ...)` —
 //   it fires on every model request, so the accumulation note still follows
 //   the configuration of the active run,
@@ -81,6 +86,10 @@ const STOP_COMMAND = "stop-auto-execution"
 const DEFAULT_HANDOFF_TOOL = "handoff_save"
 const DEFAULT_INSTRUCTION_ATTEMPTS = 5
 const DEFAULT_HEARTBEAT_SECONDS = 45
+// Stall watchdog: abort a turn that produced no events for this long (0 = off).
+// Safety net against opencode renaming/dropping turn-end events again
+// (2.0.26 removed the session.idle bus event the V1 port relied on).
+const DEFAULT_STALL_SECONDS = 900
 
 type RunConfig = {
   prompt: string
@@ -93,6 +102,7 @@ type RunConfig = {
   max_handoffs?: number
   max_instruction_attempts?: number
   heartbeat_seconds?: number
+  stall_timeout_seconds?: number
   accumulate_handoffs?: boolean
 }
 
@@ -310,7 +320,7 @@ export const AutoExecutor = Plugin.define({
         return
       }
       await startTurn(sessionID, text)
-      await waitTurn(sessionID)
+      await waitTurnGuarded(run, sessionID)
     }
 
     function waitTurn(sessionID: string): Promise<void> {
@@ -323,6 +333,61 @@ export const AutoExecutor = Plugin.define({
           resolve()
         }
       })
+    }
+
+    // Like waitTurn, but with a stall watchdog: if the turn produces no events
+    // at all (no lastActivity refresh) for stall_timeout_seconds, the session
+    // is interrupted and the wait ends as an "interrupted" turn instead of
+    // hanging forever. Safety net against opencode versions that rename or
+    // drop turn-end events (2.0.26 removed the session.idle bus event the V1
+    // port relied on — the run then hung after the first finished turn). Every
+    // event (step/usage/steering) refreshes lastActivity, so a healthy long
+    // turn is never aborted — only a truly silent one.
+    async function waitTurnGuarded(state: RunState | null, sessionID: string): Promise<void> {
+      const waiter = waiters.get(sessionID)
+      if (!waiter) return
+      const seconds = state?.cfg.stall_timeout_seconds ?? DEFAULT_STALL_SECONDS
+      if (!state || seconds <= 0) {
+        await waitTurn(sessionID)
+        return
+      }
+      let timer: ReturnType<typeof setInterval> | null = null
+      try {
+        await new Promise<void>((resolve) => {
+          const original = waiter.resolve
+          waiter.resolve = () => {
+            original()
+            resolve()
+          }
+          timer = setInterval(() => {
+            if (waiters.get(sessionID) !== waiter) {
+              // Resolved elsewhere (handler deletes the waiter first) — stop watching.
+              if (timer) clearInterval(timer)
+              timer = null
+              resolve()
+              return
+            }
+            if (state.stopping || Date.now() - state.lastActivity <= seconds * 1000) return
+            log(
+              "warn",
+              `krok ${state.step}: brak zdarzeń przez ${seconds} s — przerywam zawieszoną turę (sesja ${sessionID})`,
+            )
+            toast(
+              `Auto-exec: brak aktywności przez ${seconds} s — przerywam zawieszoną turę kroku ${state.step}.`,
+              "warning",
+              10000,
+            )
+            state.interruptedSessions.add(sessionID)
+            state.steeringPending.delete(sessionID)
+            waiters.delete(sessionID)
+            if (timer) clearInterval(timer)
+            timer = null
+            waiter.resolve()
+          }, 15000)
+        })
+      } finally {
+        if (timer) clearInterval(timer)
+      }
     }
 
     // ── heartbeat ─────────────────────────────────────────────────────────────
@@ -441,7 +506,7 @@ export const AutoExecutor = Plugin.define({
     async function monitorStep(state: RunState, firstSessionID: string): Promise<void> {
       let sessionID = firstSessionID
       while (!state.stopping) {
-        if (waiters.has(sessionID)) await waitTurn(sessionID)
+        await waitTurnGuarded(state, sessionID)
         if (state.finalChance === sessionID) state.finalChance = null
         if (state.stopping) return
         if (run && run.sessionID !== sessionID) {
@@ -573,14 +638,26 @@ export const AutoExecutor = Plugin.define({
     }
 
     // ── server events ─────────────────────────────────────────────────────────
-    // Replaces the V1 `event` hook. Turn end: session.idle (plus the
-    // execution.failed / interrupted safety nets). Context counter: the
+    // Replaces the V1 `event` hook. Turn end: session.execution.succeeded
+    // (fallback: session.idle for older opencode; aborted/failed turns via
+    // execution.interrupted/failed; stall watchdog as the last resort).
+    // Context counter: the
     // per-step tokens of `session.step.ended`/`session.step.failed` — see the
     // note inside handleEvent on why session.usage.updated must NOT be used.
     // Used by the mid-turn threshold monitoring and the execute() guard
     // (lastTokens).
     function handleEvent(event: { type: string; data?: any }): void {
-      if (event.type === "session.idle") {
+      // Turn finished (normal completion). opencode >= 2.0.26 signals it with
+      // session.execution.succeeded — verified live (2.0.26): a completed turn
+      // emits execution.started -> step.* -> step.ended -> usage.updated ->
+      // execution.succeeded, and NO bus event named session.idle ("idle" exists
+      // there only as a TUI command). Waiting for session.idle hung the run
+      // after the first finished turn (platformgame, krok 6/11: the turn ended
+      // and the loop never advanced). session.idle stays as a fallback for
+      // versions that still emit it. Guard-free on purpose: waiters exist only
+      // for run sessions, and after a handoff the finishing session may
+      // already differ from run.sessionID.
+      if (event.type === "session.idle" || event.type === "session.execution.succeeded") {
         const sessionID = event.data?.sessionID
         if (!sessionID) return
         const waiter = waiters.get(sessionID)

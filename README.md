@@ -89,7 +89,8 @@ Example configuration file: [`auto-exec.example.json`](auto-exec.example.json).
   "max_handoffs": 10,        // handoff limit per step (default: 10)
   "max_instruction_attempts": 5,  // handoff instruction limit per session (default: 5)
   "accumulate_handoffs": true,    // accumulate handoff descriptions within a step (default: true)
-  "heartbeat_seconds": 45    // UI heartbeat frequency in seconds (0 = disabled; default: 45)
+  "heartbeat_seconds": 45,   // UI heartbeat frequency in seconds (0 = disabled; default: 45)
+  "stall_timeout_seconds": 900    // abort a turn that produced no events for this long (0 = disabled; default: 900)
 }
 ```
 
@@ -166,7 +167,7 @@ The plugin reports in the TUI that it is alive — no messages means the plugin 
 - **periodic heartbeat** — every `heartbeat_seconds` (default 45 s) a toast: the current step,
   continuation number and time since last activity; `0` disables the heartbeat,
 - **new task started** — a toast when each step's session is created,
-- **agent turn finished** — a toast after each finished turn (`session.idle`),
+- **agent turn finished** — a toast after each finished turn (`session.execution.succeeded`),
 - **handoff** — a toast when a continuation session is created after `handoff_save` is called,
 - **run end / stop / error** — `success` / `warning` / `error` toasts.
 
