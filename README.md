@@ -96,10 +96,16 @@ Example configuration file: [`auto-exec.example.json`](auto-exec.example.json).
 - `{step}` in prompts is replaced with the step number.
 - Without the `model`/`agent` fields the plugin takes over **the model and agent selected in the chat**
   from which the `/auto-exec` command was issued (values from the JSON take precedence).
-- The context counter = `input + output + cache.read + cache.write` from the last error-free
-  assistant message; checked **after a finished turn** and **during a turn**
-  (the `session.usage.updated` event carries the cumulative token usage of the session,
-  supplemented by `session.step.ended`/`session.step.failed`).
+- The context counter = `input + output + cache.read + cache.write` of the last
+  finished LLM step; checked **after a finished turn** (from the last error-free
+  assistant message) and **during a turn** (from the per-step
+  `session.step.ended`/`session.step.failed` events). The
+  `session.usage.updated` event is deliberately **not** used for the threshold:
+  it carries the **cumulative billing sum of the whole session** — every step
+  re-sends the entire prompt, so the sum grows by ~the full prompt size per
+  tool call and is not comparable to a context limit (using it made the handoff
+  instruction fire after a few steps with a still-tiny real context, most
+  visibly with local lemonade models).
 
 ## How the handoff works
 

@@ -46,17 +46,20 @@
 // set nor deny it by permission — hiding it would block handing off work mid-turn; the
 // V2 prompt input has no per-prompt tool flags anyway). Protection against spontaneous
 // calls is provided by the threshold: execute() refuses until the session context exceeds
-// max_context. The threshold is also enforced DURING the turn (session.usage.updated
-// carries the cumulative session token usage): an exceedance injects a steering prompt
+// max_context. The threshold is also enforced DURING the turn (the per-step
+// tokens of session.step.ended/.failed = the real current context): an exceedance injects a steering prompt
 // asking for a handoff; once max_instruction_attempts is exhausted the turn is aborted,
 // so that super-long sessions do not appear. If the agent still does not hand off the
 // work, the instruction is repeated after the turn ends (same attempt counter).
 //
 // V2 notes (compared to the V1 implementation):
-// - token usage comes from the `session.usage.updated` event (cumulative per session)
-//   plus the per-step `session.step.ended`/`session.step.failed` events, instead of
-//   V1 `message.updated`; the counter formula is unchanged:
-//   input + output + cache.read + cache.write (reasoning tokens excluded),
+// - the per-step context counter comes from the `session.step.ended` /
+//   `session.step.failed` events (tokens of the single finished LLM request =
+//   the real current context). `session.usage.updated` is a CUMULATIVE billing
+//   sum for the whole session (each step re-counts the entire prompt) and is
+//   NOT comparable to max_context — using it fired the handoff instruction
+//   after a few tool-call steps while the real context was still tiny
+//   (lemonade/Ornith-1.5: steering at ~14.5k real context, sum >120k);
 // - turn end = `session.idle`; aborted/failed turns are recognized via
 //   `session.execution.interrupted` / `session.execution.failed`,
 // - the V1 `tool.definition` hook became a `ctx.session.hook("context", ...)` —
@@ -133,7 +136,7 @@ type RunState = {
   beatTimer: ReturnType<typeof setInterval> | null
   // set while waiting for the steering injected into an ongoing turn to be
   // processed (released on the next step end) — replaces the V1 per-message
-  // dedup (handledMsgs): session.usage.updated has no message id
+  // dedup (handledMsgs): the step events carry no message id
   steeringPending: Set<string>
   // sessions of this run whose execution was interrupted (aborted) since the
   // last turn-end handling — the V2 equivalent of the V1 MessageAbortedError check
@@ -145,11 +148,16 @@ type RunState = {
   // abort or steer it (attempts already exhausted, the abort would kill the model before
   // it managed to call the handoff tool — E2E diag2 r3)
   finalChance: string | null
-  // last known token usage per session (from session.usage.updated / step
-  // events). The tool executes BEFORE the current usage gets recorded (and
-  // after an abort the message tokens may be zeroed) — the snapshot in
-  // execute() then sees too little and rejects a legitimate handoff
-  // (E2E diag2 r4). Hence the guard uses max(snapshot, lastKnown).
+  // last known per-step token usage per session (from session.step.ended /
+  // session.step.failed — the tokens of the single finished LLM request, i.e.
+  // the real current context). The tool executes BEFORE the current usage gets
+  // recorded (and after an abort the message tokens may be zeroed) — the
+  // snapshot in execute() then sees too little and rejects a legitimate
+  // handoff (E2E diag2 r4). Hence the guard uses max(snapshot, lastKnown).
+  // NOT sourced from session.usage.updated — that event carries the
+  // cumulative billing sum of the whole session (each step re-counts the
+  // entire prompt), which inflated the counter ~8× over the real context and
+  // made the threshold (and this guard) fire way too early.
   lastTokens: Map<string, number>
 }
 
@@ -566,10 +574,11 @@ export const AutoExecutor = Plugin.define({
 
     // ── server events ─────────────────────────────────────────────────────────
     // Replaces the V1 `event` hook. Turn end: session.idle (plus the
-    // execution.failed / interrupted safety nets). Token usage:
-    // session.usage.updated (cumulative per session) — the V2 equivalent of the
-    // V1 message.updated token stream, used for the mid-turn threshold
-    // monitoring and the execute() guard (lastTokens).
+    // execution.failed / interrupted safety nets). Context counter: the
+    // per-step tokens of `session.step.ended`/`session.step.failed` — see the
+    // note inside handleEvent on why session.usage.updated must NOT be used.
+    // Used by the mid-turn threshold monitoring and the execute() guard
+    // (lastTokens).
     function handleEvent(event: { type: string; data?: any }): void {
       if (event.type === "session.idle") {
         const sessionID = event.data?.sessionID
@@ -624,27 +633,43 @@ export const AutoExecutor = Plugin.define({
         }
         return
       }
-      if (event.type === "session.usage.updated" || event.type === "session.step.ended" || event.type === "session.step.failed") {
+      if (
+        event.type === "session.usage.updated" ||
+        event.type === "session.step.ended" ||
+        event.type === "session.step.failed"
+      ) {
         run.lastActivity = Date.now()
+        // session.usage.updated carries the CUMULATIVE billing sum for the
+        // whole session: every LLM step re-sends the entire prompt, so the sum
+        // grows by ~the full prompt size PER STEP (with prompt caching that
+        // whole prompt lands in cache.read each time). Mid-step it also
+        // carries transient streaming values that shrink again when the step
+        // finalizes. Comparing that sum to max_context fired the handoff
+        // instruction after a few tool-call steps while the real context was
+        // still tiny (lemonade/Ornith-1.5, platformgame: real context ~14.5k,
+        // cumulative sum >120k after ~8 steps in ~90 s). The threshold
+        // therefore uses ONLY the per-step tokens of session.step.ended /
+        // session.step.failed: the tokens of the single finished LLM request
+        // (input + output + cache.read + cache.write of that one step) = the
+        // real current context, the V2 equivalent of the V1 per-message
+        // counter. Post-turn checks use snapshot() (last message tokens).
+        if (event.type === "session.usage.updated") return
         const t = event.data?.tokens ?? {}
         const total =
           (t.input ?? 0) + (t.output ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0)
-        // usage/step events arrive multiple times with growing values — max
-        // protects against partial values. Usage: the guard in execute(), which
-        // at tool call time does not yet see the usage of the current message
-        // (see the comment in RunState).
+        // max protects against partial values and keeps the guard in execute()
+        // conservative; a step event describes one finished request.
         if (total > (run.lastTokens.get(sessionID) ?? 0)) run.lastTokens.set(sessionID, total)
         // A step ended (an iteration of the LLM loop finished) — release the
         // steering gate so the next exceedance can steer again (the V2
         // equivalent of the V1 per-message dedup).
-        if (event.type !== "session.usage.updated") run.steeringPending.delete(sessionID)
+        run.steeringPending.delete(sessionID)
         // Threshold monitoring DURING the turn: usage above the threshold injects
         // steering with the handoff instruction into the ongoing turn; once the
         // instruction limit is exhausted, further exceedances abort the turn —
         // without waiting for its natural end (when the context escapes even
         // further) and without letting super-long sessions appear.
         if (
-          event.type === "session.usage.updated" &&
           waiters.has(sessionID) &&
           !run.steeringPending.has(sessionID) &&
           run.finalChance !== sessionID &&
