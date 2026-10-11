@@ -803,11 +803,15 @@ export const AutoExecutor = Plugin.define({
         description: `Uruchom sekwencyjne wykonywanie kroków: /${START_COMMAND} <plik.json> (wtyczka auto-executor)`,
         execute: async (input) => {
           try {
-            // prompt.text holds the arguments typed after the command name
-            // (defensively strip a repeated command prefix if present).
+            // prompt.text holds only the arguments typed after the command name
+            // (opencode strips the "/auto-exec" prefix itself; older versions
+            // passed the full text — strip a repeated command prefix if present,
+            // but ONLY when it is a real prefix, i.e. followed by whitespace or
+            // end of input: a filename may itself start with "auto-exec"
+            // (e.g. auto-exec.json) and \b would eat into it, leaving ".json").
             const arg = String(input.prompt?.text ?? "")
               .trim()
-              .replace(/^\/?auto-exec\b/, "")
+              .replace(/^\/?auto-exec(?=\s|$)/, "")
               .trim()
             if (!arg) {
               log("error", "komenda /auto-exec wywołana bez argumentu — nie uruchomiono biegu")
