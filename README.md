@@ -90,7 +90,7 @@ Example configuration file: [`auto-exec.example.json`](auto-exec.example.json).
   "max_instruction_attempts": 5,  // handoff instruction limit per session (default: 5)
   "accumulate_handoffs": true,    // accumulate handoff descriptions within a step (default: true)
   "heartbeat_seconds": 45,   // UI heartbeat frequency in seconds (0 = disabled; default: 45)
-  "stall_timeout_seconds": 900    // abort a turn that produced no events for this long (0 = disabled; default: 900)
+  "stall_timeout_seconds": 900    // abort a turn that made no progress for this long (0 = disabled; default: 900)
 }
 ```
 
@@ -107,6 +107,21 @@ Example configuration file: [`auto-exec.example.json`](auto-exec.example.json).
   tool call and is not comparable to a context limit (using it made the handoff
   instruction fire after a few steps with a still-tiny real context, most
   visibly with local lemonade models).
+- **Stall watchdog** — a turn that shows no progress for `stall_timeout_seconds`
+  is interrupted. "Progress" means bus events **or a conversation change**:
+  some local backends (llama.cpp/lemonade) emit no events while a single long
+  message streams, so the watchdog also polls the session context (~once a
+  minute) and treats any change there as activity. When it does fire it really
+  aborts the turn and waits (up to a 30 s grace) for the abort to land before
+  the next step starts — the loop never advances while the previous turn is
+  still running, and `/stop-auto-execution` interrupts **all** sessions of the
+  run, not just the current one (an unowned "zombie" turn would otherwise keep
+  occupying a serial local backend after the stop).
+- **Local models — set `max_context` below the server context window.** The
+  threshold must fire *before* the model runs out of context: with
+  `llama-server --ctx-size 100000` a `max_context` of e.g. 120000 can never
+  trigger the handoff, because the backend fails or truncates at ~100k first
+  (leave ~10–15% headroom, e.g. 85–90k).
 
 ## How the handoff works
 

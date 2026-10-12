@@ -20,7 +20,7 @@
 //   "max_handoffs": 10         // optional handoff limit per step
 //   "max_instruction_attempts": 5  // optional limit of handoff instruction retries per session
 //   "heartbeat_seconds": 45    // optional UI heartbeat frequency (0 = disabled)
-//   "stall_timeout_seconds": 900  // optional; abort a turn that produced no events for this long (0 = disabled)
+//   "stall_timeout_seconds": 900  // optional; abort a turn that made no progress for this long (0 = disabled)
 //   "accumulate_handoffs": true  // optional; handoff descriptions accumulate within a step (default true)
 // }
 //
@@ -86,10 +86,20 @@ const STOP_COMMAND = "stop-auto-execution"
 const DEFAULT_HANDOFF_TOOL = "handoff_save"
 const DEFAULT_INSTRUCTION_ATTEMPTS = 5
 const DEFAULT_HEARTBEAT_SECONDS = 45
-// Stall watchdog: abort a turn that produced no events for this long (0 = off).
-// Safety net against opencode renaming/dropping turn-end events again
-// (2.0.26 removed the session.idle bus event the V1 port relied on).
+// Stall watchdog: abort a turn that produced no progress for this long (0 =
+// off). "No progress" = no bus events AND no conversation change (the
+// liveness probe). Safety net against opencode renaming/dropping turn-end
+// events again (2.0.26 removed the session.idle bus event the V1 port relied
+// on) and against provider requests that hang forever.
 const DEFAULT_STALL_SECONDS = 900
+// Grace period for an abort to land: after the stall watchdog interrupts a
+// session the run loop does NOT advance until the turn has really ended —
+// resolved either by the session.execution.interrupted event or, at the
+// latest, after this long (a broken event stream must not hang the loop).
+const QUIESCE_GRACE_MS = 30_000
+// Watchdog tick and liveness probe period (probe every 4th tick = ~60 s).
+const WATCHDOG_TICK_MS = 15_000
+const PROBE_EVERY_TICKS = 4
 
 type RunConfig = {
   prompt: string
@@ -169,6 +179,11 @@ type RunState = {
   // entire prompt), which inflated the counter ~8× over the real context and
   // made the threshold (and this guard) fire way too early.
   lastTokens: Map<string, number>
+  // every session created by this run (steps + handoff continuations) —
+  // stopRun interrupts ALL of them, so a hung turn from an earlier step
+  // cannot outlive the run (E2E platformgame 2026-10-12: the step-8 turn
+  // survived the watchdog and later froze llama-server's only slot)
+  sessions: Set<string>
 }
 
 type Waiter = { resolve: () => void }
@@ -335,14 +350,55 @@ export const AutoExecutor = Plugin.define({
       })
     }
 
-    // Like waitTurn, but with a stall watchdog: if the turn produces no events
-    // at all (no lastActivity refresh) for stall_timeout_seconds, the session
-    // is interrupted and the wait ends as an "interrupted" turn instead of
-    // hanging forever. Safety net against opencode versions that rename or
+    // Like waitTurn, but with a stall watchdog: if the turn shows no progress
+    // (no events and no conversation change) for stall_timeout_seconds, the
+    // session is interrupted and the wait ends as an "interrupted" turn instead
+    // of hanging forever. Safety net against opencode versions that rename or
     // drop turn-end events (2.0.26 removed the session.idle bus event the V1
-    // port relied on — the run then hung after the first finished turn). Every
-    // event (step/usage/steering) refreshes lastActivity, so a healthy long
-    // turn is never aborted — only a truly silent one.
+    // port relied on — the run then hung after the first finished turn) and
+    // against provider requests that hang forever (E2E platformgame
+    // 2026-10-12: llama-server froze on a request with zero generated tokens
+    // for >7 minutes, blocking its only slot). Every event refreshes
+    // lastActivity, and the liveness probe below refreshes it when the
+    // conversation changes, so a healthy long turn is never aborted — only a
+    // truly stuck one.
+    //
+    // Liveness probe: some providers emit NO bus events while a single message
+    // streams (local llama.cpp/lemonade backends send usage only at the end of
+    // a request). A healthy local model can then take >15 min for ONE response
+    // (E2E platformgame 2026-10-12: an 18.8k-token message streamed for
+    // ~20 min, the watchdog fired at 900 s and the loop advanced while the
+    // turn kept running). The probe fingerprints the tail of the conversation
+    // (message count, last message's time fields, size of its last part);
+    // any change means the turn is progressing.
+    function conversationFingerprint(list: unknown[]): string {
+      const last = list[list.length - 1] as
+        | { time?: Record<string, unknown>; content?: unknown[] }
+        | undefined
+      if (!last) return "0"
+      const content = Array.isArray(last.content) ? last.content : []
+      const lastPart = content[content.length - 1] as unknown
+      return `${list.length}|${JSON.stringify(last.time ?? {})}|${content.length}|${
+        lastPart === undefined ? "" : JSON.stringify(lastPart).length
+      }`
+    }
+
+    const livenessFingerprints = new Map<string, string>()
+
+    async function probeLiveness(state: RunState, sessionID: string, waiter: Waiter): Promise<void> {
+      try {
+        if (waiters.get(sessionID) !== waiter || state.stopping) return
+        const list = (await ctx.session.context({ sessionID })) as unknown as unknown[]
+        if (waiters.get(sessionID) !== waiter || state.stopping) return
+        const fingerprint = conversationFingerprint(list ?? [])
+        const previous = livenessFingerprints.get(sessionID)
+        if (previous !== undefined && previous !== fingerprint) state.lastActivity = Date.now()
+        livenessFingerprints.set(sessionID, fingerprint)
+      } catch {
+        // context fetch failed — the watchdog then decides on events alone
+      }
+    }
+
     async function waitTurnGuarded(state: RunState | null, sessionID: string): Promise<void> {
       const waiter = waiters.get(sessionID)
       if (!waiter) return
@@ -352,10 +408,14 @@ export const AutoExecutor = Plugin.define({
         return
       }
       let timer: ReturnType<typeof setInterval> | null = null
+      let ticks = 0
       try {
         await new Promise<void>((resolve) => {
+          // Single funnel: every resolution path (event handler, watchdog
+          // grace, stopRun) goes through waiter.resolve.
           const original = waiter.resolve
           waiter.resolve = () => {
+            livenessFingerprints.delete(sessionID)
             original()
             resolve()
           }
@@ -367,23 +427,49 @@ export const AutoExecutor = Plugin.define({
               resolve()
               return
             }
+            ticks++
+            if (ticks % PROBE_EVERY_TICKS === 0) void probeLiveness(state, sessionID, waiter)
             if (state.stopping || Date.now() - state.lastActivity <= seconds * 1000) return
+            // ── stall confirmed: no progress for `seconds` ──
+            if (timer) clearInterval(timer)
+            timer = null
+            state.interruptedSessions.add(sessionID)
+            state.steeringPending.delete(sessionID)
+            state.lastActivity = Date.now()
             log(
               "warn",
-              `krok ${state.step}: brak zdarzeń przez ${seconds} s — przerywam zawieszoną turę (sesja ${sessionID})`,
+              `krok ${state.step}: brak postępu przez ${seconds} s — przerywam zawieszoną turę (sesja ${sessionID})`,
             )
             toast(
-              `Auto-exec: brak aktywności przez ${seconds} s — przerywam zawieszoną turę kroku ${state.step}.`,
+              `Auto-exec: brak postępu przez ${seconds} s — przerywam zawieszoną turę kroku ${state.step}.`,
               "warning",
               10000,
             )
-            state.interruptedSessions.add(sessionID)
-            state.steeringPending.delete(sessionID)
-            waiters.delete(sessionID)
-            if (timer) clearInterval(timer)
-            timer = null
-            waiter.resolve()
-          }, 15000)
+            // Actually abort the hung turn. Previously the watchdog only
+            // resolved the waiter — the turn kept running while the loop
+            // advanced to the next step; the two turns then fought over a
+            // serial local backend's single KV-cache slot, and an unowned
+            // "zombie" turn could outlive the run entirely (E2E platformgame
+            // 2026-10-12: the step-8 turn streamed ~6 min past its own
+            // watchdog, its next request froze llama-server's only slot, and
+            // the run went on to spawn further steps against a dead backend).
+            void ctx.session.interrupt({ sessionID }).catch(() => {})
+            // Do not unblock the loop until the turn has really ended: the
+            // session.execution.interrupted event resolves the waiter through
+            // handleEvent; the grace timer is only the fallback for a broken
+            // event stream (the very reason the watchdog exists).
+            const grace = setTimeout(() => {
+              if (waiters.get(sessionID) === waiter) {
+                waiters.delete(sessionID)
+                waiter.resolve()
+              }
+            }, QUIESCE_GRACE_MS)
+            const wrapped = waiter.resolve
+            waiter.resolve = () => {
+              clearTimeout(grace)
+              wrapped()
+            }
+          }, WATCHDOG_TICK_MS)
         })
       } finally {
         if (timer) clearInterval(timer)
@@ -491,7 +577,53 @@ export const AutoExecutor = Plugin.define({
       if (state.cfg.model) body.model = parseModel(state.cfg.model)
       if (state.cfg.agent) body.agent = state.cfg.agent
       const info = await ctx.session.create(body)
+      state.sessions.add(info.id)
       return info.id
+    }
+
+    // ── step-overlap guard ────────────────────────────────────────────────────
+    // Never open the next step's turn while the previous session's turn may
+    // still be running. On a serial local backend (llama-server --parallel 1)
+    // two concurrent turns fight over the single KV-cache slot: every handover
+    // evicts the other's cache and forces a full re-prefill of the whole
+    // context. The normal paths (turn-end events, the watchdog with its grace
+    // period) all guarantee a dead turn; this is the belt-and-suspenders for
+    // anything else. ctx.session.wait resolves when the session has no ongoing
+    // work; every call is capped, so an interrupt that never lands cannot hang
+    // the loop forever.
+    async function waitIdle(sessionID: string, timeoutMs: number): Promise<boolean | null> {
+      // true = idle, false = still busy after the cap, null = endpoint unavailable
+      const call = ctx.session.wait({ sessionID })
+      const cap = new Promise<boolean | null>((resolve) => setTimeout(() => resolve(false), timeoutMs))
+      const raced = await Promise.race([
+        call.then(
+          () => true,
+          (error: unknown) => {
+            log("debug", `session.wait niedostępny: ${error instanceof Error ? error.message : String(error)}`)
+            return null as boolean | null
+          },
+        ),
+        cap,
+      ])
+      void call.catch(() => {})
+      return raced
+    }
+
+    async function quiesceSession(sessionID: string): Promise<void> {
+      const started = Date.now()
+      for (;;) {
+        const remaining = QUIESCE_GRACE_MS - (Date.now() - started)
+        if (remaining <= 0) break
+        const result = await waitIdle(sessionID, remaining)
+        if (result !== false) return // idle, or endpoint unavailable (event paths remain the guarantee)
+        await new Promise((r) => setTimeout(r, 1000))
+      }
+      log(
+        "warn",
+        `sesja ${sessionID} nadal zajęta po ${Math.round(QUIESCE_GRACE_MS / 1000)} s — przerywam jej turę przed kolejnym krokiem`,
+      )
+      await ctx.session.interrupt({ sessionID }).catch(() => {})
+      await waitIdle(sessionID, QUIESCE_GRACE_MS)
     }
 
     // ── the handoff tool ──────────────────────────────────────────────────────
@@ -576,6 +708,10 @@ export const AutoExecutor = Plugin.define({
           )
           await sendTurn(sessionID, renderPrompt(state.cfg.prompt, step))
           await monitorStep(state, sessionID)
+          // Belt and suspenders: make sure the finished session really has no
+          // running turn before opening the next one (a hung turn must never
+          // overlap with the next step's turn).
+          await quiesceSession(sessionID)
         }
         stopBeat(state)
         if (run === state) run = null
@@ -610,6 +746,7 @@ export const AutoExecutor = Plugin.define({
         finalAttempts: new Map(),
         finalChance: null,
         lastTokens: new Map(),
+        sessions: new Set(),
         handoffSummaries: [],
       }
       run = state
@@ -628,8 +765,12 @@ export const AutoExecutor = Plugin.define({
       if (!run) return false
       run.stopping = true
       stopBeat(run)
-      const id = run.sessionID
-      if (id) void ctx.session.interrupt({ sessionID: id }).catch(() => {})
+      // Interrupt EVERY session of the run, not only the current one: a turn
+      // from an earlier step that outlived its step (hung provider request)
+      // would otherwise keep occupying a serial local backend after the stop.
+      for (const id of run.sessions) {
+        void ctx.session.interrupt({ sessionID: id }).catch(() => {})
+      }
       for (const [sid, waiter] of [...waiters]) {
         waiters.delete(sid)
         waiter.resolve()
