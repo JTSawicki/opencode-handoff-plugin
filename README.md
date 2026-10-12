@@ -180,7 +180,10 @@ and aborts the agent's active turn (`ctx.session.interrupt`).
 The plugin reports in the TUI that it is alive — no messages means the plugin has died:
 
 - **periodic heartbeat** — every `heartbeat_seconds` (default 45 s) a toast: the current step,
-  continuation number and time since last activity; `0` disables the heartbeat,
+  continuation number and time since last activity; `0` disables the heartbeat. The heartbeat
+  toast always closes **before the next beat arrives** (its display time is capped below the
+  interval): the TUI shows one toast at a time and queues the rest behind a "+N more" badge, so
+  a heartbeat toast living longer than its own interval piles the queue up unboundedly,
 - **new task started** — a toast when each step's session is created,
 - **agent turn finished** — a toast after each finished turn (`session.execution.succeeded`),
 - **handoff** — a toast when a continuation session is created after `handoff_save` is called,

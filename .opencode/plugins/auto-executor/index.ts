@@ -480,10 +480,17 @@ export const AutoExecutor = Plugin.define({
     const beat = (state: RunState) => {
       if (state.stopping || run !== state) return
       const since = Math.max(0, Math.round((Date.now() - state.lastActivity) / 1000))
+      // The TUI displays ONE toast at a time and queues the rest (the "+N more"
+      // badge). A heartbeat must therefore close before the next beat arrives:
+      // with heartbeat_seconds=5 and an 8 s toast the queue grew forever
+      // (E2E platformgame 2026-10-12: "+126 more" after ~30 min — arrivals
+      // 1/5 s outpaced dismissals 1/8 s by ~0.075/s). Cap the display time
+      // below the interval; the 8 s cap keeps the comfortable default (45 s).
+      const intervalMs = (state.cfg.heartbeat_seconds ?? DEFAULT_HEARTBEAT_SECONDS) * 1000
       toast(
         `Auto-exec tętno: krok ${state.step}/${state.cfg.to}, kontynuacja ${state.continuation}/${state.cfg.max_handoffs ?? 10}, ostatnia aktywność ${since} s temu`,
         "info",
-        8000,
+        Math.max(1500, Math.min(8000, intervalMs - 1000)),
       )
     }
 
