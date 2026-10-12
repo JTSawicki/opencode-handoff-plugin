@@ -19,6 +19,7 @@
 //   "tool_description": "..."  // optional description of the tool passed to the agent
 //   "max_handoffs": 10         // optional handoff limit per step
 //   "max_instruction_attempts": 5  // optional limit of handoff instruction retries per session
+//   "instruction_retry_seconds": 60  // optional minimum pause between repeated handoff instructions (0 = off)
 //   "heartbeat_seconds": 45    // optional UI heartbeat frequency (0 = disabled)
 //   "stall_timeout_seconds": 900  // optional; abort a turn that made no progress for this long (0 = disabled)
 //   "accumulate_handoffs": true  // optional; handoff descriptions accumulate within a step (default true)
@@ -85,6 +86,15 @@ const START_COMMAND = "auto-exec"
 const STOP_COMMAND = "stop-auto-execution"
 const DEFAULT_HANDOFF_TOOL = "handoff_save"
 const DEFAULT_INSTRUCTION_ATTEMPTS = 5
+// Minimum pause between REPEATED handoff instructions (applies to the mid-turn
+// steering and the post-turn retries alike). A repeat that chases the previous
+// instruction within seconds burns the whole attempt budget while the model is
+// still acting on the first one (it usually has to finish its current tool call
+// before it can call the handoff tool), floods the context with duplicate
+// instructions (each of them also costs tokens) and aborts turns that would
+// have handed off given a little more time. The FIRST instruction for a session
+// is never delayed; 0 disables the pause.
+const DEFAULT_INSTRUCTION_RETRY_SECONDS = 60
 const DEFAULT_HEARTBEAT_SECONDS = 45
 // Stall watchdog: abort a turn that produced no progress for this long (0 =
 // off). "No progress" = no bus events AND no conversation change (the
@@ -111,6 +121,7 @@ type RunConfig = {
   tool_description?: string
   max_handoffs?: number
   max_instruction_attempts?: number
+  instruction_retry_seconds?: number
   heartbeat_seconds?: number
   stall_timeout_seconds?: number
   accumulate_handoffs?: boolean
@@ -151,6 +162,10 @@ type RunState = {
   handoffSummaries: string[]
   sessionID: string
   instructionAttempts: Map<string, number>
+  // time of the last handoff instruction sent to a session (mid-turn steering
+  // or post-turn retry) — paces the REPEATS: a new instruction is only sent
+  // when instruction_retry_seconds have passed since this timestamp
+  lastInstructionAt: Map<string, number>
   stopping: boolean
   lastActivity: number
   beatTimer: ReturnType<typeof setInterval> | null
@@ -226,6 +241,10 @@ function loadConfig(raw: string): RunConfig {
     max_handoffs: json.max_handoffs !== undefined ? Number(json.max_handoffs) : undefined,
     max_instruction_attempts:
       json.max_instruction_attempts !== undefined ? Number(json.max_instruction_attempts) : undefined,
+    instruction_retry_seconds:
+      json.instruction_retry_seconds !== undefined
+        ? Number(json.instruction_retry_seconds)
+        : undefined,
     heartbeat_seconds:
       json.heartbeat_seconds !== undefined ? Number(json.heartbeat_seconds) : undefined,
     accumulate_handoffs:
@@ -241,6 +260,10 @@ function loadConfig(raw: string): RunConfig {
   if (cfg.max_instruction_attempts !== undefined) {
     if (!Number.isFinite(cfg.max_instruction_attempts) || cfg.max_instruction_attempts < 1)
       throw new Error(`plik ${file}: "max_instruction_attempts" musi być liczbą >= 1`)
+  }
+  if (cfg.instruction_retry_seconds !== undefined) {
+    if (!Number.isFinite(cfg.instruction_retry_seconds) || cfg.instruction_retry_seconds < 0)
+      throw new Error(`plik ${file}: "instruction_retry_seconds" musi być liczbą >= 0`)
   }
   if (cfg.heartbeat_seconds !== undefined) {
     if (!Number.isFinite(cfg.heartbeat_seconds) || cfg.heartbeat_seconds < 0)
@@ -642,6 +665,18 @@ export const AutoExecutor = Plugin.define({
     const accumulateNote = `Handoffs accumulate within a step: the new conversation receives the original task, then the descriptions of ALL earlier handoffs of this step (numbered, in order), then the newest one. Do not repeat their content — describe what has been done in the current conversation since the last handoff (for the first handoff: since the start of the step).`
 
     // ── main step loop ────────────────────────────────────────────────────────
+    // Sleep that ends early when the run is stopping — used to pace repeated
+    // handoff instructions (instruction_retry_seconds).
+    async function sleepStoppingAware(state: RunState, ms: number): Promise<void> {
+      const chunkMs = 500
+      let left = ms
+      while (left > 0 && !state.stopping) {
+        const waited = Math.min(chunkMs, left)
+        await new Promise((r) => setTimeout(r, waited))
+        left -= waited
+      }
+    }
+
     async function monitorStep(state: RunState, firstSessionID: string): Promise<void> {
       let sessionID = firstSessionID
       while (!state.stopping) {
@@ -690,7 +725,24 @@ export const AutoExecutor = Plugin.define({
           toast(`Auto-exec: krok ${state.step} — agent nie wykonał handoffu mimo ${attempts} instrukcji, krok zakończony.`, "warning", 10000)
           return
         }
+        // Pacing: a repeated instruction must not chase the previous one — the
+        // model needs time to actually act on it (finish the current tool call,
+        // call the handoff tool). The FIRST instruction for this session is
+        // never delayed; only repeats wait out the remaining cooldown. During
+        // the wait the session is idle, so its token count cannot shrink.
+        const retryMs = (state.cfg.instruction_retry_seconds ?? DEFAULT_INSTRUCTION_RETRY_SECONDS) * 1000
+        const lastInstruction = state.lastInstructionAt.get(sessionID) ?? 0
+        const remaining = retryMs - (Date.now() - lastInstruction)
+        if (remaining > 0) {
+          log(
+            "info",
+            `krok ${state.step}: ponowienie instrukcji handoff odczeka ${Math.ceil(remaining / 1000)} s (minimalna przerwa między instrukcjami)`,
+          )
+          await sleepStoppingAware(state, remaining)
+          if (state.stopping) return
+        }
         state.instructionAttempts.set(sessionID, attempts + 1)
+        state.lastInstructionAt.set(sessionID, Date.now())
         log("info", `krok ${state.step}: kontekst ${snap.tokens} > ${state.cfg.max_context} — instrukcja handoff (próba ${attempts + 1}/${maxAttempts})`)
         await sendTurn(sessionID, instructionText(state, attempts + 1, maxAttempts))
       }
@@ -744,6 +796,7 @@ export const AutoExecutor = Plugin.define({
         continuation: 0,
         sessionID: "",
         instructionAttempts: new Map(),
+        lastInstructionAt: new Map(),
         stopping: false,
         lastActivity: Date.now(),
         beatTimer: null,
@@ -904,10 +957,27 @@ export const AutoExecutor = Plugin.define({
           const maxAttempts = run.cfg.max_instruction_attempts ?? DEFAULT_INSTRUCTION_ATTEMPTS
           const attempts = run.instructionAttempts.get(sessionID) ?? 0
           if (attempts < maxAttempts) {
+            // Pacing: a repeated steering must not chase the previous
+            // instruction one LLM step later — that burned the attempt budget
+            // within seconds of a single turn (steeringPending is released on
+            // every step end) while the model was still acting on the first
+            // instruction. Skip this step end; the next one re-evaluates, so
+            // the repeat comes later, not faster. The FIRST instruction for
+            // the session is never delayed.
+            const retryMs = (run.cfg.instruction_retry_seconds ?? DEFAULT_INSTRUCTION_RETRY_SECONDS) * 1000
+            const lastInstruction = run.lastInstructionAt.get(sessionID) ?? 0
+            if (lastInstruction && Date.now() - lastInstruction < retryMs) {
+              log(
+                "debug",
+                `krok ${run.step}: ponowienie instrukcji handoff wstrzymane — poprzednia była ${Math.round((Date.now() - lastInstruction) / 1000)} s temu (przerwa ${Math.round(retryMs / 1000)} s)`,
+              )
+              return
+            }
             // Injecting steering into the ongoing turn: the agent sees the
             // handoff instruction in that very turn and can hand off the work
             // immediately (the tool is always visible).
             run.instructionAttempts.set(sessionID, attempts + 1)
+            run.lastInstructionAt.set(sessionID, Date.now())
             log(
               "info",
               `krok ${run.step}: próg kontekstu W TRAKCIE tury (${total} > ${run.cfg.max_context}) — wstrzykuję steering z ${toolName} (próba ${attempts + 1}/${maxAttempts})`,

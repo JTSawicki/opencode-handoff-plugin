@@ -88,6 +88,7 @@ Example configuration file: [`auto-exec.example.json`](auto-exec.example.json).
   "tool_description": "description of the handoff_save tool for the agent",  // optional
   "max_handoffs": 10,        // handoff limit per step (default: 10)
   "max_instruction_attempts": 5,  // handoff instruction limit per session (default: 5)
+  "instruction_retry_seconds": 60,  // minimum pause between repeated handoff instructions (default: 60; 0 = no pause)
   "accumulate_handoffs": true,    // accumulate handoff descriptions within a step (default: true)
   "heartbeat_seconds": 45,   // UI heartbeat frequency in seconds (0 = disabled; default: 45)
   "stall_timeout_seconds": 900    // abort a turn that made no progress for this long (0 = disabled; default: 900)
@@ -143,13 +144,21 @@ The threshold is enforced at two levels:
 1. **After a finished turn** — if the context > `max_context`, the agent gets an instruction
    ("You are running out of context window. Call the handoff_save tool…") and must describe the state
    of the work in the `description` argument. The instruction is **repeated** in subsequent turns
-   (limit: `max_instruction_attempts`, default 5 attempts per session).
+   (limit: `max_instruction_attempts`, default 5 attempts per session); a repeat waits until
+   `instruction_retry_seconds` (default 60) have passed since the previous instruction — the model
+   needs time to act on it (it usually has to finish its current tool call first), and a repeat that
+   chases the previous one within seconds just burns the attempt budget. The first instruction for a
+   session is never delayed.
 2. **During a turn** — every token-usage update above the threshold injects **steering**: a steering prompt sent into the ongoing turn
    (`ctx.session.prompt` delivers the message into the current turn) — the agent sees it
    immediately and can perform the handoff without finishing the turn. Steering is deduplicated
-   (one per step of the agent loop; released on the next step end) and uses the same attempt counter as the post-turn path.
+   (one per step of the agent loop; released on the next step end), uses the same attempt counter as the post-turn path and
+   is **paced** the same way: a repeated steering is skipped while
+   `instruction_retry_seconds` have not yet passed since the previous instruction (the next step end
+   re-evaluates, so the repeat comes later, not faster).
    After `max_instruction_attempts` is exhausted, further threshold exceedances **abort the turn**
-   (`ctx.session.interrupt`) — this prevents super-long sessions that cannot be rescued.
+   (`ctx.session.interrupt`) — this prevents super-long sessions that cannot be rescued (the abort
+   is a safety net and is not delayed by the pacing).
 
 After an aborted turn (abort) there is still a **last chance**: one clean turn with the handoff
 instruction ("LAST CHANCE…"), in which the mid-turn handler does not interfere — a model in a clean
